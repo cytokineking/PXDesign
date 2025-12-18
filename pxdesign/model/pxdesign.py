@@ -153,12 +153,12 @@ class ProtenixDesign(nn.Module):
         # [..., N_sample, N_atom, 3]
         N_sample = self.configs.sample_diffusion["N_sample"]
         N_step = self.configs.sample_diffusion["N_step"]
-        print(f"Design inference with {N_step} N_step")
+        logger.info("Design inference: N_sample=%s, N_step=%s", N_sample, N_step)
 
         noise_schedule = self.inference_noise_scheduler(
             N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
         )
-        print(f"Protenix-Design sample diffusion: {self.configs.sample_diffusion}")
+        logger.info("Protenix-Design sample diffusion config: %s", self.configs.sample_diffusion)
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,

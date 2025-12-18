@@ -72,6 +72,8 @@ def common_run_options(func):
         --dump_dir / -o
         --input / -i
         --dtype
+        --stream_dump / --no_stream_dump
+        --pxdesign_progress_interval
         --N_sample
         --N_step
         --eta_type
@@ -130,6 +132,26 @@ def common_run_options(func):
         help="Inference dtype.",
     )
     @click.option(
+        "--stream_dump/--no_stream_dump",
+        default=True,
+        show_default="enabled",
+        help=(
+            "Enable incremental streaming dump (resume-safe). "
+            "Writes CIFs during inference; slightly slower but prevents losing all progress."
+        ),
+    )
+    @click.option(
+        "--pxdesign_progress_interval",
+        type=click.FloatRange(min=0.0),
+        default=30.0,
+        show_default=True,
+        envvar="PXDESIGN_PROGRESS_INTERVAL",
+        help=(
+            "Seconds between diffusion progress logs (0 disables). "
+            "Sets PXDESIGN_PROGRESS_INTERVAL."
+        ),
+    )
+    @click.option(
         "--input",
         "-i",
         "input_path",
@@ -146,6 +168,12 @@ def common_run_options(func):
     )
     @wraps(func)
     def wrapper(*args, **kwargs):
+
+        # Runtime knobs (passed via env vars; not forwarded to Hydra/config parsing).
+        stream_dump = bool(kwargs.pop("stream_dump"))
+        pxdesign_progress_interval = float(kwargs.pop("pxdesign_progress_interval"))
+        os.environ["PXDESIGN_STREAM_DUMP"] = "1" if stream_dump else "0"
+        os.environ["PXDESIGN_PROGRESS_INTERVAL"] = str(pxdesign_progress_interval)
 
         # Extract common options from kwargs and pack them into a single dict.
         common = dict(

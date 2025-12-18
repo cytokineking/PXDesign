@@ -57,6 +57,7 @@ from pxdesign.runner.dumper import DataDumper
 from pxdesign.runner.helpers import save_top_designs, use_target_template_or_not
 from pxdesign.runner.inference import InferenceRunner
 from pxdesign.runner.presets import PRESETS
+from pxdesign.utils.heartbeat import HeartbeatReporter
 from pxdesign.utils.infer import (
     convert_to_bioassembly_dict,
     derive_seed,
@@ -111,11 +112,27 @@ class DesignPipeline(InferenceRunner):
         os.makedirs(self.dump_dir, exist_ok=True)
         self.dumper = DataDumper(base_dir=self.dump_dir)
 
+        # Pipeline context for heartbeat/log consumers
+        os.environ["PXDESIGN_STAGE"] = "diffusion"
+        os.environ["PXDESIGN_SEED"] = str(seed)
+        os.environ["PXDESIGN_GLOBAL_RUN"] = str(self.global_run)
+
         seed_everything(seed=seed, deterministic=True)
         orig_seqs = self._inference(seed)
 
         if DIST_WRAPPER.world_size > 1:
             torch.distributed.barrier()
+
+        # Stage transition: evaluation
+        os.environ["PXDESIGN_STAGE"] = "evaluation"
+        hb = HeartbeatReporter.from_env()
+        if hb is not None:
+            hb.update(
+                produced_total=int(getattr(self.configs.sample_diffusion, "N_sample", 0) or 0),
+                expected_total=int(getattr(self.configs.sample_diffusion, "N_sample", 0) or 0),
+                extra={"stage_transition": "evaluation"},
+                force=True,
+            )
 
         if self.use_ptx_filter:
             use_target_template = None
@@ -335,6 +352,8 @@ def detect_use_ptx_filter(configs) -> bool:
 
 def main(argv=None):
     configs, p = parse_args(argv)
+    os.environ.setdefault("PXDESIGN_STATUS_DIR", str(configs.dump_dir))
+    os.environ["PXDESIGN_STAGE"] = "startup"
     os.makedirs(configs.dump_dir, exist_ok=True)
     configs.input_json_path = process_input_file(
         configs.input_json_path, out_dir=configs.dump_dir
@@ -461,6 +480,15 @@ def main(argv=None):
         if not next_inputs or i == p["N_max_runs"] - 1:
             print("Finish all designs!")
             if DIST_WRAPPER.rank == 0:
+                os.environ["PXDESIGN_STAGE"] = "ranking"
+                hb = HeartbeatReporter.from_env()
+                if hb is not None:
+                    hb.update(
+                        produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                        expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                        extra={"stage_transition": "ranking"},
+                        force=True,
+                    )
                 save_top_designs(
                     p,
                     configs,
@@ -471,6 +499,10 @@ def main(argv=None):
 
     if DIST_WRAPPER.rank == 0:
         print("----------Current progress: 100.00%----------")
+    os.environ["PXDESIGN_STAGE"] = "completed"
+    hb = HeartbeatReporter.from_env()
+    if hb is not None:
+        hb.complete(extra={"message": "pipeline complete"})
 
 
 if __name__ == "__main__":

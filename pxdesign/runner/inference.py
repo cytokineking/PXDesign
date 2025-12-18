@@ -17,9 +17,11 @@ import logging
 import os
 import time
 import traceback
+from glob import glob
 from contextlib import nullcontext
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from protenix.config import save_config
@@ -30,6 +32,8 @@ from protenix.utils.torch_utils import to_device
 from pxdesign.data.infer_data_pipeline import InferenceDataset, get_inference_dataloader
 from pxdesign.model.pxdesign import ProtenixDesign
 from pxdesign.runner.dumper import DataDumper
+from pxdesign.runner.dumper import save_structure_cif
+from pxdesign.model import generator as diffusion_generator
 from pxdesign.utils.infer import (
     configure_runtime_env,
     convert_to_bioassembly_dict,
@@ -83,6 +87,10 @@ class InferenceRunner(object):
         self.error_dir = os.path.join(self.dump_dir, "ERR")
         os.makedirs(self.dump_dir, exist_ok=True)
         os.makedirs(self.error_dir, exist_ok=True)
+        # Default heartbeat location (can be overridden externally).
+        # NOTE: Use configs.dump_dir (root output dir) rather than self.dump_dir,
+        # because DesignPipeline rebinds self.dump_dir to per-global-run subdirs.
+        os.environ.setdefault("PXDESIGN_STATUS_DIR", str(self.configs.dump_dir))
 
     def init_model(self) -> None:
         self.model = ProtenixDesign(self.configs).to(self.device)
@@ -157,6 +165,12 @@ class InferenceRunner(object):
                     logger.info(data_error_message)
                     continue
                 sample = data["sample_name"]
+                # Surface context to lower-level code (diffusion heartbeat / logs).
+                os.environ["PXDESIGN_STAGE"] = "diffusion"
+                os.environ["PXDESIGN_TASK_NAME"] = str(sample)
+                os.environ["PXDESIGN_SEED"] = str(seed)
+                if hasattr(self, "global_run"):
+                    os.environ["PXDESIGN_GLOBAL_RUN"] = str(getattr(self, "global_run"))
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] {sample}: "
                     f"N_asym={data['N_asym'].item()}, N_token={data['N_token'].item()}, "
@@ -175,18 +189,119 @@ class InferenceRunner(object):
                     self.print(f"Skip sample={sample}: already dumped.")
                     continue
 
-                pred = self.predict(data)
-                self.dumper.dump(
-                    "",
-                    sample,
-                    seed,
-                    pred_dict=pred,
-                    atom_array=atom_array,
-                    entity_poly_type=data["entity_poly_type"],
+                stream_dump = os.environ.get("PXDESIGN_STREAM_DUMP", "").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }
+
+                # Where outputs go for this task/seed
+                dump_dir = self.dumper._get_dump_dir("", sample, seed)
+                pred_dir = os.path.join(dump_dir, "predictions")
+                os.makedirs(pred_dir, exist_ok=True)
+
+                def _existing_indices(pred_dir: str, sample_name: str) -> set[int]:
+                    out: set[int] = set()
+                    for fp in glob(os.path.join(pred_dir, f"{sample_name}_sample_*.cif")):
+                        base = os.path.basename(fp)
+                        # "<sample>_sample_<idx>.cif"
+                        parts = base.rsplit("_sample_", 1)
+                        if len(parts) != 2:
+                            continue
+                        idx_str = parts[1].removesuffix(".cif")
+                        if idx_str.isdigit():
+                            out.add(int(idx_str))
+                    return out
+
+                expected_total = int(
+                    getattr(self.configs.sample_diffusion, "N_sample", 0) or 0
                 )
-                logger.info(
-                    f"[Rank {DIST_WRAPPER.rank}] {sample} succeeded. Saved to {self.dumper._get_dump_dir('', sample, seed)}"
-                )
+
+                if stream_dump and expected_total > 0:
+                    done = _existing_indices(pred_dir, sample)
+                    missing = [i for i in range(expected_total) if i not in done]
+
+                    if not missing:
+                        # Ensure completion marker exists (job may have died after dumping)
+                        self.dumper._mark_task_complete(dump_dir)
+                        logger.info(
+                            f"[Rank {DIST_WRAPPER.rank}] {sample} already has "
+                            f"{len(done)}/{expected_total} CIFs. Marked complete."
+                        )
+                        continue
+
+                    logger.info(
+                        f"[Rank {DIST_WRAPPER.rank}] {sample} streaming dump enabled. "
+                        f"Found {len(done)}/{expected_total} CIFs, generating {len(missing)} missing."
+                    )
+
+                    # Resume-aware progress reporting for heartbeat / logs
+                    os.environ["PXDESIGN_EXPECTED_SAMPLES"] = str(expected_total)
+                    os.environ["PXDESIGN_COMPLETED_BASE"] = str(len(done))
+
+                    # Prepare atom_array annotations once (matches DataDumper._save_structure)
+                    atom_array.set_annotation(
+                        "b_factor", np.round(np.zeros(len(atom_array)).astype(float), 2)
+                    )
+                    if "occupancy" not in atom_array._annot:
+                        atom_array.set_annotation(
+                            "occupancy", np.round(np.ones(len(atom_array)), 2)
+                        )
+
+                    entity_poly_type = data["entity_poly_type"]
+
+                    def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
+                        # chunk_coords: [chunk, N_atom, 3]
+                        for local_i, out_idx in enumerate(indices):
+                            out_path = os.path.join(
+                                pred_dir, f"{sample}_sample_{out_idx}.cif"
+                            )
+                            if os.path.exists(out_path):
+                                continue
+                            save_structure_cif(
+                                atom_array=atom_array,
+                                pred_coordinate=chunk_coords[local_i],
+                                output_fpath=out_path,
+                                entity_poly_type=entity_poly_type,
+                                pdb_id=sample,
+                            )
+
+                    # Temporarily reduce N_sample to remaining work and stream results.
+                    orig_n_sample = expected_total
+                    self.configs.sample_diffusion.N_sample = int(len(missing))
+                    diffusion_generator.set_stream_chunk_callback(
+                        _chunk_cb,
+                        sample_indices=missing,
+                    )
+                    try:
+                        _ = self.predict(data)
+                    finally:
+                        diffusion_generator.clear_stream_chunk_callback()
+                        self.configs.sample_diffusion.N_sample = orig_n_sample
+
+                    done2 = _existing_indices(pred_dir, sample)
+                    if len(done2) != expected_total:
+                        raise RuntimeError(
+                            f"Streaming dump incomplete for {sample}: have {len(done2)}/{expected_total} CIFs"
+                        )
+
+                    self.dumper._mark_task_complete(dump_dir)
+                    logger.info(
+                        f"[Rank {DIST_WRAPPER.rank}] {sample} streaming dump complete. Saved to {dump_dir}"
+                    )
+                else:
+                    pred = self.predict(data)
+                    self.dumper.dump(
+                        "",
+                        sample,
+                        seed,
+                        pred_dict=pred,
+                        atom_array=atom_array,
+                        entity_poly_type=data["entity_poly_type"],
+                    )
+                    logger.info(
+                        f"[Rank {DIST_WRAPPER.rank}] {sample} succeeded. Saved to {self.dumper._get_dump_dir('', sample, seed)}"
+                    )
             except Exception as e:
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample} {e}:\n{traceback.format_exc()}"

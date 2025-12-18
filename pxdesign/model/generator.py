@@ -12,11 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Sequence, Union
+
+import os
+import time
 
 import numpy as np
 import torch
 from protenix.model.utils import centre_random_augmentation
+from protenix.utils.logger import get_logger
+
+from pxdesign.utils.heartbeat import HeartbeatReporter
+
+logger = get_logger(__name__)
+
+# -----------------------------------------------------------------------------
+# Streaming / incremental dump hooks (set by runner)
+# -----------------------------------------------------------------------------
+
+_STREAM_CHUNK_CALLBACK: Optional[Callable[[torch.Tensor, list[int]], None]] = None
+_STREAM_SAMPLE_INDICES: Optional[list[int]] = None
+
+
+def set_stream_chunk_callback(
+    callback: Callable[[torch.Tensor, list[int]], None],
+    *,
+    sample_indices: Sequence[int] | None = None,
+) -> None:
+    """
+    Enable streaming mode for diffusion sampling.
+
+    When enabled, `sample_diffusion` will call `callback(chunk_coords, indices)`
+    after each diffusion chunk finishes and will NOT accumulate all coordinates
+    in memory.
+
+    Args:
+        callback: function called once per chunk.
+        sample_indices: optional mapping from generated sample order -> output index.
+            If provided, must have length equal to the N_sample passed to sampling.
+    """
+    global _STREAM_CHUNK_CALLBACK, _STREAM_SAMPLE_INDICES
+    _STREAM_CHUNK_CALLBACK = callback
+    _STREAM_SAMPLE_INDICES = list(sample_indices) if sample_indices is not None else None
+
+
+def clear_stream_chunk_callback() -> None:
+    """Disable streaming mode."""
+    global _STREAM_CHUNK_CALLBACK, _STREAM_SAMPLE_INDICES
+    _STREAM_CHUNK_CALLBACK = None
+    _STREAM_SAMPLE_INDICES = None
 
 
 class InferenceNoiseScheduler:
@@ -128,9 +172,55 @@ def sample_diffusion(
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
-    print("sampling eta schedule: ", step_scale_eta)
+    n_step = max(int(len(noise_schedule) - 1), 0)
+    logger.info("sampling eta schedule: %s", step_scale_eta)
 
-    def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
+    # Optional heartbeat + progress (best-effort, throttled)
+    hb = HeartbeatReporter.from_env()
+    t0 = time.time()
+    hb_expected_total = int(os.environ.get("PXDESIGN_EXPECTED_SAMPLES", str(N_sample)) or N_sample)
+    hb_completed_base = int(os.environ.get("PXDESIGN_COMPLETED_BASE", "0") or 0)
+    hb_expected_total = max(hb_expected_total, 1)
+    hb_completed_base = max(hb_completed_base, 0)
+    if hb is not None:
+        hb.start(expected_total=hb_expected_total)
+        # If resuming, reflect already-produced designs immediately.
+        if hb_completed_base:
+            hb.update(
+                produced_total=hb_completed_base,
+                expected_total=hb_expected_total,
+                extra={"resume": {"completed_base": hb_completed_base}},
+                force=True,
+            )
+
+    progress_interval_s = float(os.environ.get("PXDESIGN_PROGRESS_INTERVAL", "30") or 30)
+    step_heartbeat_interval_s = float(
+        os.environ.get("PXDESIGN_STEP_HEARTBEAT_INTERVAL", "30") or 30
+    )
+    last_progress_log_ts = 0.0
+    last_step_heartbeat_ts = 0.0
+    stream_cb = _STREAM_CHUNK_CALLBACK
+    stream_indices = _STREAM_SAMPLE_INDICES
+    stream_enabled = stream_cb is not None
+    if stream_indices is not None and len(stream_indices) != int(N_sample):
+        raise ValueError(
+            f"stream sample_indices length ({len(stream_indices)}) "
+            f"must equal N_sample ({int(N_sample)})"
+        )
+
+    # Streaming requires chunking; if user disabled chunking, pick a small default.
+    if stream_enabled and diffusion_chunk_size is None:
+        diffusion_chunk_size = int(os.environ.get("PXDESIGN_STREAM_CHUNK_SIZE", "10") or 10)
+
+    def _chunk_sample_diffusion(
+        chunk_n_sample: int,
+        inplace_safe: bool,
+        *,
+        chunk_index: int,
+        num_chunks: int,
+        completed_before_chunk: int,
+    ):
+        nonlocal last_progress_log_ts, last_step_heartbeat_ts
         # init noise
         # [..., N_sample, N_atom, 3]
         x_l = noise_schedule[0] * torch.randn(
@@ -140,6 +230,48 @@ def sample_diffusion(
         for step_t, (c_tau_last, c_tau) in enumerate(
             zip(noise_schedule[:-1], noise_schedule[1:])
         ):
+            # "Liveness" heartbeat during long diffusion chunks (no design outputs
+            # are written until the full chunk completes).
+            now = time.time()
+            if (
+                hb is not None
+                and step_heartbeat_interval_s > 0
+                and (now - last_step_heartbeat_ts) >= step_heartbeat_interval_s
+            ):
+                extra = {
+                    "diffusion": {
+                        "chunk_index": int(chunk_index) + 1,
+                        "num_chunks": int(num_chunks),
+                        "step": int(step_t) + 1,
+                        "num_steps": int(T - 1),
+                        "chunk_samples": int(chunk_n_sample),
+                        "completed_samples": int(completed_before_chunk),
+                        "total_samples": int(N_sample),
+                    }
+                }
+                hb.update(
+                    produced_total=int(hb_completed_base + completed_before_chunk),
+                    expected_total=int(hb_expected_total),
+                    extra=extra,
+                )
+                last_step_heartbeat_ts = now
+
+            if (
+                progress_interval_s > 0
+                and (now - last_progress_log_ts) >= progress_interval_s
+            ):
+                # Note: produced_total does NOT advance until the chunk finishes.
+                logger.info(
+                    "[diffusion] chunk %d/%d | step %d/%d | completed %d/%d samples",
+                    int(chunk_index) + 1,
+                    int(num_chunks),
+                    int(step_t) + 1,
+                    int(T - 1),
+                    int(hb_completed_base + completed_before_chunk),
+                    int(hb_expected_total),
+                )
+                last_progress_log_ts = now
+
             # [..., N_sample, N_atom, 3]
             x_l = (
                 centre_random_augmentation(x_input_coords=x_l, N_sample=1)
@@ -208,13 +340,37 @@ def sample_diffusion(
         return x_l
 
     if diffusion_chunk_size is None:
-        x_l = _chunk_sample_diffusion(N_sample, inplace_safe=inplace_safe)
+        x_l = _chunk_sample_diffusion(
+            int(N_sample),
+            inplace_safe=inplace_safe,
+            chunk_index=0,
+            num_chunks=1,
+            completed_before_chunk=0,
+        )
+        if stream_enabled:
+            indices = (
+                stream_indices
+                if stream_indices is not None
+                else list(range(0, int(N_sample)))
+            )
+            assert stream_cb is not None
+            stream_cb(x_l, indices)
+            # Return an empty tensor to avoid holding all coordinates in memory.
+            x_l = torch.empty((*batch_shape, 0, N_atom, 3), device=device, dtype=dtype)
+        if hb is not None:
+            hb.update(
+                produced_total=int(hb_completed_base + N_sample),
+                expected_total=int(hb_expected_total),
+                extra={"diffusion": {"num_steps": int(n_step)}},
+                force=True,
+            )
     else:
-        print("diffusion_chunk_size: ", diffusion_chunk_size)
+        logger.info("diffusion_chunk_size: %s", diffusion_chunk_size)
         x_l = []
         no_chunks = N_sample // diffusion_chunk_size + (
             N_sample % diffusion_chunk_size != 0
         )
+        completed = 0
         for i in range(no_chunks):
             chunk_n_sample = (
                 diffusion_chunk_size
@@ -222,9 +378,72 @@ def sample_diffusion(
                 else N_sample - i * diffusion_chunk_size
             )
             chunk_x_l = _chunk_sample_diffusion(
-                chunk_n_sample, inplace_safe=inplace_safe
+                int(chunk_n_sample),
+                inplace_safe=inplace_safe,
+                chunk_index=int(i),
+                num_chunks=int(no_chunks),
+                completed_before_chunk=int(completed),
             )
-            x_l.append(chunk_x_l)
+            if stream_enabled:
+                assert stream_cb is not None
+                start = int(completed)
+                end = int(completed + chunk_n_sample)
+                indices = (
+                    stream_indices[start:end]
+                    if stream_indices is not None
+                    else list(range(start, end))
+                )
+                stream_cb(chunk_x_l, indices)
+            else:
+                x_l.append(chunk_x_l)
+            completed += int(chunk_n_sample)
 
-        x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
+            # Chunk-complete progress is the only "ground-truth" progress in terms
+            # of finished samples, because outputs are written after sampling.
+            if hb is not None:
+                hb.update(
+                    produced_total=int(hb_completed_base + completed),
+                    expected_total=int(hb_expected_total),
+                    extra={
+                        "diffusion": {
+                            "chunk_index": int(i) + 1,
+                            "num_chunks": int(no_chunks),
+                            "completed_samples": int(hb_completed_base + completed),
+                            "total_samples": int(hb_expected_total),
+                            "num_steps": int(n_step),
+                        }
+                    },
+                )
+
+            # Human-friendly progress line (throttled)
+            now = time.time()
+            if (
+                progress_interval_s > 0
+                and (
+                    (now - last_progress_log_ts) >= progress_interval_s
+                    or completed == int(N_sample)
+                    or i == 0
+                )
+            ):
+                elapsed = max(now - t0, 1e-6)
+                rate = float(completed) / elapsed
+                eta_s = (float(N_sample - completed) / rate) if rate > 0 else None
+                logger.info(
+                    "[diffusion] %d/%d samples (%.1f%%) | chunk %d/%d | rate %.2f samples/min | eta %s",
+                    int(hb_completed_base + completed),
+                    int(hb_expected_total),
+                    100.0
+                    * (float(hb_completed_base + completed) / max(float(hb_expected_total), 1.0)),
+                    int(i) + 1,
+                    int(no_chunks),
+                    rate * 60.0,
+                    f"{eta_s:.0f}s" if isinstance(eta_s, (int, float)) else "?",
+                )
+                last_progress_log_ts = now
+
+        if stream_enabled:
+            # Return an empty tensor to avoid holding all coordinates in memory.
+            x_l = torch.empty((*batch_shape, 0, N_atom, 3), device=device, dtype=dtype)
+        else:
+            x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
     return x_l

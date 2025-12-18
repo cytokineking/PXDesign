@@ -478,6 +478,43 @@ usage**.
 
 <br>
 
+#### Step 4: Monitor long runs (progress + heartbeat)
+
+PXDesign often generates many designs inside a single diffusion forward pass (e.g., `--N_sample 10000`), so stdout can be sparse for long stretches.
+
+To make long-running jobs easier to monitor, PXDesign writes:
+
+- **Periodic diffusion progress logs** (time-throttled; defaults to ~30s)
+- **A heartbeat JSON** at `<out_dir>/status.json` (rank-0 aggregate) and `<out_dir>/status_rank{rank}.json` (per-rank)
+
+Useful environment variables:
+
+- `PXDESIGN_HEARTBEAT_INTERVAL`: heartbeat write interval in seconds (default: `15`)
+- `PXDESIGN_PROGRESS_INTERVAL`: progress log interval in seconds (default: `30`)
+- `PXDESIGN_STEP_HEARTBEAT_INTERVAL`: liveness heartbeat interval during diffusion steps in seconds (default: `30`)
+- To disable heartbeat writing: set `PXDESIGN_STATUS_DIR=""` before running
+
+CLI flags (recommended):
+
+- `--pxdesign_progress_interval <sec>`: sets `PXDESIGN_PROGRESS_INTERVAL` (default: `30`, `0` disables)
+
+#### Step 5 (Optional): Streaming dump + resume for ultra-long jobs
+
+For very long runs, it can be useful to **dump designs incrementally** and support
+**resume after interruption**. PXDesign can stream diffusion outputs per chunk:
+
+- Streaming dump is **enabled by default** in the `pxdesign` CLI.
+  - Disable with `--no_stream_dump`
+  - If running `python -m pxdesign.runner.inference` directly, set `PXDESIGN_STREAM_DUMP=1` to enable it.
+- On restart, PXDesign will scan existing `*_sample_*.cif` files and only generate
+  missing indices, then mark the task complete.
+
+Notes:
+- Streaming dump can slightly reduce throughput (it writes CIFs during inference),
+  but it prevents catastrophic “all progress lost” failures.
+- CIF writes are atomic (`.tmp` then rename) to avoid corrupted partial artifacts.
+
+
 
 
 

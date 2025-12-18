@@ -198,9 +198,13 @@ def save_structure_cif(
     pred_atom_array = copy.deepcopy(atom_array)
     pred_pose = pred_coordinate.cpu().numpy()
     pred_atom_array.coord = pred_pose
+
+    # Atomic write (tmp + rename) so partial CIFs don't look "complete" for resume.
+    tmp_path = f"{output_fpath}.tmp"
     save_atoms_to_cif(
-        output_fpath,
+        tmp_path,
         pred_atom_array,
         entity_poly_type,
         pdb_id,
     )
+    os.replace(tmp_path, output_fpath)
