@@ -163,10 +163,11 @@ def save_design_cif(
     task_name = task["task_name"]
     src = os.path.join(
         base_dir,
-        f"global_run_{task['run_idx']}",
+        "runs",
+        f"run_{int(task['run_idx']):03d}",
+        "diffusion",
+        "structures",
         task_name,
-        f"seed_{task['seed']}",
-        "predictions",
         task["name"] + ".cif",
     )
     dst = os.path.join(output_dir, output_subdir, f"rank_{task[rank_col]}.cif")
@@ -187,10 +188,10 @@ def save_af2_docked(
     matches = glob(
         os.path.join(
             base_dir,
-            f"global_run_{task['run_idx']}",
+            "runs",
+            f"run_{int(task['run_idx']):03d}",
+            "eval",
             task_name,
-            f"seed_{task['seed']}",
-            "predictions",
             "af2_pred",
             f"*{sample_name}_seq{task['seq_idx']}_model*.pdb",
         )

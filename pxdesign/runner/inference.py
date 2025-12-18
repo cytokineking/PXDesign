@@ -130,7 +130,10 @@ class InferenceRunner(object):
             input_json_path=self.configs.input_json_path,
             use_msa=self.configs.use_msa,
         )
-        self.design_test_dl = get_inference_dataloader(configs=self.configs)
+        self.design_test_dl = get_inference_dataloader(
+            configs=self.configs,
+            distributed_tasks=bool(getattr(self.configs, "distributed_tasks", True)),
+        )
 
     @torch.no_grad()
     def predict(self, data: Mapping[str, Mapping[str, Any]]) -> dict[str, torch.Tensor]:
@@ -155,39 +158,55 @@ class InferenceRunner(object):
         return prediction
 
     @torch.no_grad()
-    def _inference(self, seed: int):
+    def _inference(self, run_seed: int):
         num_data = len(self.dataset)
         orig_seqs = {}
+        # v2 run context (set by pipeline; default run_000)
+        run_id = int(getattr(self, "run_id", 0) or 0)
+        run_dir = str(
+            getattr(
+                self,
+                "run_dir",
+                os.path.join(self.configs.dump_dir, "runs", f"run_{run_id:03d}"),
+            )
+        )
+        active_tasks = getattr(self, "active_tasks", None)
+        active_tasks = set(active_tasks) if active_tasks is not None else None
+
+        # Surface context to lower-level code (diffusion heartbeat / logs).
+        os.environ["PXDESIGN_STAGE"] = "diffusion"
+        os.environ["PXDESIGN_SEED"] = str(run_seed)
+        os.environ["PXDESIGN_GLOBAL_RUN"] = str(run_id)
         for batch in self.design_test_dl:
             data, atom_array, data_error_message = batch[0]
             try:
                 if data_error_message:
                     logger.info(data_error_message)
                     continue
-                sample = data["sample_name"]
-                # Surface context to lower-level code (diffusion heartbeat / logs).
-                os.environ["PXDESIGN_STAGE"] = "diffusion"
-                os.environ["PXDESIGN_TASK_NAME"] = str(sample)
-                os.environ["PXDESIGN_SEED"] = str(seed)
-                if hasattr(self, "global_run"):
-                    os.environ["PXDESIGN_GLOBAL_RUN"] = str(getattr(self, "global_run"))
+                sample = str(data["sample_name"])
+                if active_tasks is not None and sample not in active_tasks:
+                    logger.info(
+                        f"[Rank {DIST_WRAPPER.rank}] Skip inactive task={sample}"
+                    )
+                    continue
+
+                os.environ["PXDESIGN_TASK_NAME"] = sample
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] {sample}: "
                     f"N_asym={data['N_asym'].item()}, N_token={data['N_token'].item()}, "
                     f"N_atom={data['N_atom'].item()}, N_msa={data['N_msa'].item()}"
                 )
                 if sample not in orig_seqs:
-                    data["sequences"].pop(-1)  # generated binder chain
-                    for seq_idx, seq in enumerate(data["sequences"]):
+                    # Copy to avoid mutating the batch object.
+                    seqs = json.loads(json.dumps(data.get("sequences", [])))
+                    if seqs:
+                        seqs.pop(-1)  # generated binder chain
+                    for seq_idx, seq in enumerate(seqs):
                         ent_k = list(seq.keys())[0]
                         label_asym_id = f"{chr(ord('A') + seq_idx)}0"
                         assert seq[ent_k]["count"] == 1
                         seq[ent_k]["label_asym_id"] = [label_asym_id]
-                    orig_seqs[data["sample_name"]] = data["sequences"]
-
-                if self.dumper.check_completion("", sample, seed):
-                    self.print(f"Skip sample={sample}: already dumped.")
-                    continue
+                    orig_seqs[sample] = seqs
 
                 stream_dump = os.environ.get("PXDESIGN_STREAM_DUMP", "").lower() in {
                     "1",
@@ -195,14 +214,18 @@ class InferenceRunner(object):
                     "yes",
                 }
 
-                # Where outputs go for this task/seed
-                dump_dir = self.dumper._get_dump_dir("", sample, seed)
-                pred_dir = os.path.join(dump_dir, "predictions")
-                os.makedirs(pred_dir, exist_ok=True)
+                # v2 diffusion output directory for this run/task:
+                #   <dump_dir>/runs/run_XXX/diffusion/structures/<task_name>/*.cif
+                struct_dir = os.path.join(
+                    run_dir, "diffusion", "structures", str(sample)
+                )
+                os.makedirs(struct_dir, exist_ok=True)
 
-                def _existing_indices(pred_dir: str, sample_name: str) -> set[int]:
+                def _existing_indices(struct_dir: str, sample_name: str) -> set[int]:
                     out: set[int] = set()
-                    for fp in glob(os.path.join(pred_dir, f"{sample_name}_sample_*.cif")):
+                    for fp in glob(
+                        os.path.join(struct_dir, f"{sample_name}_sample_*.cif")
+                    ):
                         base = os.path.basename(fp)
                         # "<sample>_sample_<idx>.cif"
                         parts = base.rsplit("_sample_", 1)
@@ -216,92 +239,119 @@ class InferenceRunner(object):
                 expected_total = int(
                     getattr(self.configs.sample_diffusion, "N_sample", 0) or 0
                 )
+                if expected_total <= 0:
+                    logger.info(f"[Rank {DIST_WRAPPER.rank}] {sample}: N_sample=0, skip.")
+                    continue
 
-                if stream_dump and expected_total > 0:
-                    done = _existing_indices(pred_dir, sample)
-                    missing = [i for i in range(expected_total) if i not in done]
+                world_size = max(int(DIST_WRAPPER.world_size), 1)
+                rank = int(DIST_WRAPPER.rank)
 
-                    if not missing:
-                        # Ensure completion marker exists (job may have died after dumping)
-                        self.dumper._mark_task_complete(dump_dir)
-                        logger.info(
-                            f"[Rank {DIST_WRAPPER.rank}] {sample} already has "
-                            f"{len(done)}/{expected_total} CIFs. Marked complete."
-                        )
-                        continue
+                # Compute existing + missing design IDs (global view).
+                done_all = _existing_indices(struct_dir, sample)
+                done_all = {i for i in done_all if 0 <= i < expected_total}
+                missing_all = [i for i in range(expected_total) if i not in done_all]
 
+                # Partition by design_id ownership (world-size agnostic).
+                my_missing = [i for i in missing_all if (i % world_size) == rank]
+
+                # Heartbeat accounting: expected/progress is per-rank ownership.
+                # This makes rank-0 aggregation meaningful (sums to global totals).
+                if expected_total - 1 >= rank:
+                    owned_total = ((expected_total - 1 - rank) // world_size) + 1
+                else:
+                    owned_total = 0
+                owned_done = sum(1 for i in done_all if (i % world_size) == rank)
+
+                os.environ["PXDESIGN_EXPECTED_SAMPLES"] = str(int(owned_total))
+                os.environ["PXDESIGN_COMPLETED_BASE"] = str(int(owned_done))
+
+                if not my_missing:
                     logger.info(
-                        f"[Rank {DIST_WRAPPER.rank}] {sample} streaming dump enabled. "
-                        f"Found {len(done)}/{expected_total} CIFs, generating {len(missing)} missing."
+                        f"[Rank {rank}] {sample}: "
+                        f"owned_done={owned_done}/{owned_total} (global_done={len(done_all)}/{expected_total}). "
+                        "Nothing to generate."
                     )
+                    continue
 
-                    # Resume-aware progress reporting for heartbeat / logs
-                    os.environ["PXDESIGN_EXPECTED_SAMPLES"] = str(expected_total)
-                    os.environ["PXDESIGN_COMPLETED_BASE"] = str(len(done))
+                logger.info(
+                    f"[Rank {rank}] {sample}: "
+                    f"global_done={len(done_all)}/{expected_total}, "
+                    f"rank_owned_done={owned_done}/{owned_total}, "
+                    f"generating_missing={len(my_missing)}"
+                )
 
-                    # Prepare atom_array annotations once (matches DataDumper._save_structure)
+                # Prepare atom_array annotations once (matches DataDumper._save_structure)
+                atom_array.set_annotation(
+                    "b_factor", np.round(np.zeros(len(atom_array)).astype(float), 2)
+                )
+                if "occupancy" not in atom_array._annot:
                     atom_array.set_annotation(
-                        "b_factor", np.round(np.zeros(len(atom_array)).astype(float), 2)
+                        "occupancy", np.round(np.ones(len(atom_array)), 2)
                     )
-                    if "occupancy" not in atom_array._annot:
-                        atom_array.set_annotation(
-                            "occupancy", np.round(np.ones(len(atom_array)), 2)
+
+                entity_poly_type = data["entity_poly_type"]
+
+                def _out_path(out_idx: int) -> str:
+                    return os.path.join(
+                        struct_dir, f"{sample}_sample_{int(out_idx):06d}.cif"
+                    )
+
+                def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
+                    # chunk_coords: [chunk, N_atom, 3]
+                    for local_i, out_idx in enumerate(indices):
+                        out_path = _out_path(int(out_idx))
+                        if os.path.exists(out_path):
+                            continue
+                        save_structure_cif(
+                            atom_array=atom_array,
+                            pred_coordinate=chunk_coords[local_i],
+                            output_fpath=out_path,
+                            entity_poly_type=entity_poly_type,
+                            pdb_id=sample,
                         )
 
-                    entity_poly_type = data["entity_poly_type"]
-
-                    def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
-                        # chunk_coords: [chunk, N_atom, 3]
-                        for local_i, out_idx in enumerate(indices):
-                            out_path = os.path.join(
-                                pred_dir, f"{sample}_sample_{out_idx}.cif"
-                            )
-                            if os.path.exists(out_path):
-                                continue
+                # Temporarily reduce N_sample to this rank's missing work.
+                orig_n_sample = int(expected_total)
+                self.configs.sample_diffusion.N_sample = int(len(my_missing))
+                try:
+                    if stream_dump:
+                        diffusion_generator.set_stream_chunk_callback(
+                            _chunk_cb,
+                            sample_indices=my_missing,
+                        )
+                        _ = self.predict(data)
+                    else:
+                        pred = self.predict(data)
+                        coords = pred.get("coordinate", None)
+                        if coords is None:
+                            raise RuntimeError("Model prediction missing 'coordinate'.")
+                        for local_i, out_idx in enumerate(my_missing):
                             save_structure_cif(
                                 atom_array=atom_array,
-                                pred_coordinate=chunk_coords[local_i],
-                                output_fpath=out_path,
+                                pred_coordinate=coords[local_i],
+                                output_fpath=_out_path(int(out_idx)),
                                 entity_poly_type=entity_poly_type,
                                 pdb_id=sample,
                             )
-
-                    # Temporarily reduce N_sample to remaining work and stream results.
-                    orig_n_sample = expected_total
-                    self.configs.sample_diffusion.N_sample = int(len(missing))
-                    diffusion_generator.set_stream_chunk_callback(
-                        _chunk_cb,
-                        sample_indices=missing,
-                    )
-                    try:
-                        _ = self.predict(data)
-                    finally:
+                finally:
+                    if stream_dump:
                         diffusion_generator.clear_stream_chunk_callback()
-                        self.configs.sample_diffusion.N_sample = orig_n_sample
+                    self.configs.sample_diffusion.N_sample = orig_n_sample
 
-                    done2 = _existing_indices(pred_dir, sample)
-                    if len(done2) != expected_total:
-                        raise RuntimeError(
-                            f"Streaming dump incomplete for {sample}: have {len(done2)}/{expected_total} CIFs"
-                        )
-
-                    self.dumper._mark_task_complete(dump_dir)
-                    logger.info(
-                        f"[Rank {DIST_WRAPPER.rank}] {sample} streaming dump complete. Saved to {dump_dir}"
+                # Verify that this rank's owned IDs are fully present.
+                done2 = _existing_indices(struct_dir, sample)
+                done2 = {i for i in done2 if 0 <= i < expected_total}
+                owned_done2 = sum(1 for i in done2 if (i % world_size) == rank)
+                if owned_done2 != int(owned_total):
+                    raise RuntimeError(
+                        f"v2 streaming dump incomplete for rank-owned IDs: "
+                        f"task={sample} rank={rank} owned_done={owned_done2}/{owned_total} "
+                        f"(global_done={len(done2)}/{expected_total})"
                     )
-                else:
-                    pred = self.predict(data)
-                    self.dumper.dump(
-                        "",
-                        sample,
-                        seed,
-                        pred_dict=pred,
-                        atom_array=atom_array,
-                        entity_poly_type=data["entity_poly_type"],
-                    )
-                    logger.info(
-                        f"[Rank {DIST_WRAPPER.rank}] {sample} succeeded. Saved to {self.dumper._get_dump_dir('', sample, seed)}"
-                    )
+                logger.info(
+                    f"[Rank {rank}] {sample} diffusion complete for owned IDs. "
+                    f"owned_done={owned_done2}/{owned_total} (global_done={len(done2)}/{expected_total})"
+                )
             except Exception as e:
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample} {e}:\n{traceback.format_exc()}"
@@ -321,6 +371,8 @@ class InferenceRunner(object):
 
 def main(argv=None):
     configs = get_configs(argv)
+    os.environ.setdefault("PXDESIGN_STATUS_DIR", str(configs.dump_dir))
+    os.environ["PXDESIGN_STAGE"] = "startup"
     os.makedirs(configs.dump_dir, exist_ok=True)
     configs.input_json_path = process_input_file(
         configs.input_json_path, out_dir=configs.dump_dir
@@ -328,15 +380,26 @@ def main(argv=None):
     download_inference_cache(configs)
 
     # convert cif / pdb to bioassembly dict
+    input_tasks_path = os.path.join(configs.dump_dir, "input_tasks.json")
     if DIST_WRAPPER.rank == 0:
         save_config(configs, os.path.join(configs.dump_dir, "config.yaml"))
         with open(configs.input_json_path, "r") as f:
             orig_inputs = json.load(f)
         for x in orig_inputs:
             convert_to_bioassembly_dict(x, configs.dump_dir)
-        configs.input_json_path = os.path.join(configs.dump_dir, "input_tasks.json")
-        with open(configs.input_json_path, "w") as f:
+        tmp = input_tasks_path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(orig_inputs, f, indent=4)
+        os.replace(tmp, input_tasks_path)
+    else:
+        # Best-effort wait for rank-0 to finish writing (no dist barrier yet).
+        while not os.path.exists(input_tasks_path):
+            time.sleep(0.2)
+
+    configs.input_json_path = input_tasks_path
+
+    # v2: replicate tasks across ranks; partition design_id instead.
+    setattr(configs, "distributed_tasks", False)
 
     runner = InferenceRunner(configs)
 
@@ -345,11 +408,27 @@ def main(argv=None):
         logger.info("Nothing to infer. Bye!")
         return
 
-    seeds = [derive_seed(time.time_ns())] if not configs.seeds else configs.seeds
-    for seed in seeds:
-        print(f"----------Infer with seed {seed}----------")
-        seed_everything(seed=seed, deterministic=False)
-        runner._inference(seed)
+    seeds = [int(time.time_ns() % (2**31 - 1))] if not configs.seeds else list(configs.seeds)
+    for run_id, run_seed in enumerate(seeds):
+        print(f"----------Infer run {run_id} (run_seed={run_seed})----------")
+
+        # v2 run context
+        runner.run_id = int(run_id)
+        runner.run_dir = os.path.join(
+            configs.dump_dir, "runs", f"run_{int(run_id):03d}"
+        )
+
+        os.environ["PXDESIGN_STAGE"] = "diffusion"
+        os.environ["PXDESIGN_GLOBAL_RUN"] = str(int(run_id))
+        os.environ["PXDESIGN_SEED"] = str(int(run_seed))
+
+        # Per-rank RNG seed derived from run_seed
+        rank_seed = int(derive_seed(int(run_seed), int(DIST_WRAPPER.rank), digits=9))
+        seed_everything(seed=rank_seed, deterministic=True)
+        runner._inference(int(run_seed))
+
+        if DIST_WRAPPER.world_size > 1:
+            torch.distributed.barrier()
 
 
 if __name__ == "__main__":

@@ -41,22 +41,35 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", module="biotite")
 
 
-def get_inference_dataloader(configs: Any) -> DataLoader:
+def get_inference_dataloader(
+    configs: Any,
+    *,
+    distributed_tasks: bool | None = None,
+) -> DataLoader:
     inference_dataset = InferenceDataset(
         input_json_path=configs.input_json_path,
         use_msa=configs.use_msa,
     )
-    # data = inference_dataset[0]
-    sampler = DistributedSampler(
-        dataset=inference_dataset,
-        num_replicas=DIST_WRAPPER.world_size,
-        rank=DIST_WRAPPER.rank,
-        shuffle=False,
-    )
+    # NOTE (v2 pipeline):
+    # By default we partition tasks across ranks via DistributedSampler.
+    # For v2 resume + sample-parallelism we often want *replicated tasks*
+    # (each rank sees the same tasks and partitions design_id instead).
+    if distributed_tasks is None:
+        distributed_tasks = bool(getattr(configs, "distributed_tasks", True))
+
+    sampler = None
+    if DIST_WRAPPER.world_size > 1 and distributed_tasks:
+        sampler = DistributedSampler(
+            dataset=inference_dataset,
+            num_replicas=DIST_WRAPPER.world_size,
+            rank=DIST_WRAPPER.rank,
+            shuffle=False,
+        )
     dataloader = DataLoader(
         dataset=inference_dataset,
         batch_size=1,
         sampler=sampler,
+        shuffle=False,
         collate_fn=lambda batch: batch,
         num_workers=configs.num_workers,
     )

@@ -374,6 +374,54 @@ def pipeline(
 
 
 # ---------------------------------------------------------------------------
+# `rank` subcommand — rerun final selection only (v2)
+# ---------------------------------------------------------------------------
+
+
+@cli.command(
+    name="rank",
+    context_settings=dict(
+        ignore_unknown_options=True,
+        allow_extra_args=True,
+    ),
+)
+@click.option(
+    "--dump_dir",
+    "-o",
+    type=str,
+    required=True,
+    help="Existing v2 output directory (same as pipeline --dump_dir).",
+)
+@click.option(
+    "--run_id",
+    type=int,
+    default=None,
+    show_default=True,
+    help="Optional run_id to write final outputs under (defaults to latest run_*).",
+)
+@click.pass_context
+def rank(ctx: click.Context, dump_dir: str, run_id: int | None) -> None:
+    """
+    Re-run the derived ranking/selection stage only (no diffusion/eval).
+
+    This reads existing eval outputs under:
+        <dump_dir>/runs/run_*/eval/<task>/sample_level_output.csv
+
+    and writes:
+        <dump_dir>/runs/run_XXX/final/*
+        <dump_dir>/design_outputs/<task>/*
+    """
+    from . import rank as _rank
+
+    extra_args: List[str] = list(ctx.args)
+    argv: List[str] = ["--dump_dir", str(dump_dir)]
+    if run_id is not None:
+        argv.extend(["--run_id", str(int(run_id))])
+    argv.extend(extra_args)
+    _rank.main(argv)
+
+
+# ---------------------------------------------------------------------------
 # `check-input` subcommand — validate YAML config
 # ---------------------------------------------------------------------------
 

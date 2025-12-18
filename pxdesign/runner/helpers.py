@@ -362,8 +362,6 @@ def process_preview_results(
     if selected_df.empty:
         return
     task_name = selected_df["task_name"].iloc[0]
-    if DIST_WRAPPER.world_size > 1:
-        task_name = task_name[: -len("_chunk*")]
     df = selected_df.copy()
 
     # Save original design CIFs
@@ -434,8 +432,6 @@ def process_extended_results(
     if selected_df.empty:
         return
     task_name = selected_df["task_name"].iloc[0]
-    if DIST_WRAPPER.world_size > 1:
-        task_name = task_name[: -len("_chunk*")]
 
     # Optional PTX rerun for pass_ptx rows
     if "pass_ptx" in selected_df.columns and selected_df["pass_ptx"].any():
@@ -560,7 +556,7 @@ def save_difficulty_fig(df, mode, save_dir, use_template=False):
         subprocess.run(cmd, check=True)
 
 
-def save_top_designs(p, configs, orig_seqs, use_template=False):
+def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final_dir: str):
     """
     Collect all sample-level CSVs, decide which ranking mode to use, and
     write out top designs + difficulty figure.
@@ -578,6 +574,7 @@ def save_top_designs(p, configs, orig_seqs, use_template=False):
     """
     output_dir = os.path.join(configs.dump_dir, "design_outputs")
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(final_dir, exist_ok=True)
 
     # Collect per-sample CSVs for final selection/serialization
     merged_df = collect_sample_csvs(configs.dump_dir)
@@ -586,7 +583,7 @@ def save_top_designs(p, configs, orig_seqs, use_template=False):
     if merged_df.empty:
         return
 
-    merged_df.to_csv(os.path.join(configs.dump_dir, "all_summary.csv"), index=False)
+    merged_df.to_csv(os.path.join(final_dir, "all_summary.csv"), index=False)
 
     # Decide ranking mode based on presence of PTX columns
     mode_used = infer_mode_from_df(merged_df)
@@ -599,7 +596,7 @@ def save_top_designs(p, configs, orig_seqs, use_template=False):
             rmsd_col="af2_complex_pred_design_rmsd",
         )
         pre_filtered.to_csv(
-            os.path.join(configs.dump_dir, "filtered_summary.csv"), index=False
+            os.path.join(final_dir, "filtered_summary.csv"), index=False
         )
 
         save_dir = process_preview_results(pre_filtered, configs.dump_dir, output_dir)
@@ -613,7 +610,7 @@ def save_top_designs(p, configs, orig_seqs, use_template=False):
             w_ptx=p["extended_w_ptx"],
         )
         pre_filtered.to_csv(
-            os.path.join(configs.dump_dir, "filtered_summary.csv"), index=False
+            os.path.join(final_dir, "filtered_summary.csv"), index=False
         )
 
         save_dir = process_extended_results(
@@ -809,10 +806,11 @@ def rerun_ptx(
     for _, row in result_df.iterrows():
         src = os.path.join(
             base_dir,
-            f"global_run_{row['run_idx']}",
+            "runs",
+            f"run_{int(row['run_idx']):03d}",
+            "diffusion",
+            "structures",
             row["task_name"],
-            f"seed_{row['seed']}",
-            "predictions",
             row["name"] + ".cif",
         )
         dst_name = f"run_{row['run_idx']}_{row['name']}_seq{row['seq_idx']}"
@@ -852,16 +850,15 @@ def rerun_ptx(
 
 def collect_sample_csvs(base_dir: str) -> pd.DataFrame:
     """
-    Collect all sample_level_output.csv files from multiple global runs
+    Collect all sample_level_output.csv files from multiple v2 runs
     into a single DataFrame.
 
     Expected directory layout:
-      base_dir/global_run_*/<task_name>/seed_*/predictions/sample_level_output.csv
+      base_dir/runs/run_*/eval/<task_name>/sample_level_output.csv
 
     For each CSV, the following metadata columns are prepended:
       - task_name
-      - run_idx  (derived from global_run_X)
-      - seed     (derived from seed_Y)
+      - run_idx  (derived from run_XXX)
 
     Returns
     -------
@@ -871,10 +868,10 @@ def collect_sample_csvs(base_dir: str) -> pd.DataFrame:
     """
     pattern = os.path.join(
         base_dir,
-        "global_run_*",
+        "runs",
+        "run_*",
+        "eval",
         "*",
-        "seed_*",
-        "predictions",
         "sample_level_output.csv",
     )
     file_list = glob(pattern)
@@ -885,28 +882,19 @@ def collect_sample_csvs(base_dir: str) -> pd.DataFrame:
     dfs = []
     for fp in file_list:
         parts = fp.split(os.sep)
-        run_idx, task_name, seed = (
-            parts[-5].replace("global_run_", ""),
-            parts[-4],
-            parts[-3].replace("seed_", ""),
-        )
+        # .../runs/run_000/eval/<task_name>/sample_level_output.csv
+        run_idx = parts[-4].replace("run_", "")
+        task_name = parts[-2]
         df = pd.read_csv(fp)
         df.insert(0, "task_name", task_name)
-        df.insert(1, "run_idx", run_idx)
-        df.insert(2, "seed", seed)
+        df.insert(1, "run_idx", int(run_idx) if str(run_idx).isdigit() else run_idx)
         dfs.append(df)
     return pd.concat(dfs, ignore_index=True)
 
 
 def cleanup_outputs(root) -> None:
     root = Path(root)
-    # Remove redundant summary files
-    for fname in ["all_summary.csv", "filtered_summary.csv"]:
-        p = root / fname
-        if p.exists():
-            p.unlink()
-
-    # Remove PTX re-run outputs
+    # Remove PTX re-run outputs (temporary scratch for extended ranking)
     ptx_dir = root / "ptx_final_outputs"
     if ptx_dir.exists():
         shutil.rmtree(ptx_dir)
