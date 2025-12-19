@@ -681,6 +681,17 @@ def main(argv=None):
                         logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
                         continue
                     pdb_dir, pdb_names, cond_chains, binder_chains = convert_cifs_to_pdbs(struct_dir)
+
+                    # Respect Input: Filter to only include indices requested in this session
+                    pdb_names = [
+                        n
+                        for n in pdb_names
+                        if any(f"_sample_{i:06d}" in n for i in done)
+                    ]
+                    if not pdb_names:
+                        logger.info(f"[pipeline] No matching designs for {task_name} in index range 0..{expected_total-1}. Skipping eval.")
+                        continue
+
                     eval_input = {
                         "task": "binder",
                         "name": task_name,

@@ -208,7 +208,7 @@ class InferenceRunner(object):
                         seq[ent_k]["label_asym_id"] = [label_asym_id]
                     orig_seqs[sample] = seqs
 
-                stream_dump = os.environ.get("PXDESIGN_STREAM_DUMP", "").lower() in {
+                stream_dump = os.environ.get("PXDESIGN_STREAM_DUMP", "1").lower() in {
                     "1",
                     "true",
                     "yes",
@@ -297,7 +297,11 @@ class InferenceRunner(object):
                     )
 
                 def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
-                    # chunk_coords: [chunk, N_atom, 3]
+                    # chunk_coords: [..., chunk, N_atom, 3]
+                    # Squeeze all batch dimensions (assuming batch size 1)
+                    while chunk_coords.ndim > 3:
+                        chunk_coords = chunk_coords.squeeze(0)
+
                     for local_i, out_idx in enumerate(indices):
                         out_path = _out_path(int(out_idx))
                         if os.path.exists(out_path):

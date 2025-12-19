@@ -578,10 +578,29 @@ def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final
 
     # Collect per-sample CSVs for final selection/serialization
     merged_df = collect_sample_csvs(configs.dump_dir)
-    merged_df = convert_strlist_col(merged_df)
-    merged_df = merged_df.dropna(axis=1, how="all")
     if merged_df.empty:
         return
+
+    # Respect Input: Filter designs by index to match current N_sample
+    expected_total = int(getattr(configs.sample_diffusion, "N_sample", 0) or 0)
+    if expected_total > 0:
+
+        def _get_idx(name):
+            try:
+                return int(str(name).rsplit("_sample_", 1)[-1])
+            except:
+                return -1
+
+        merged_df["_temp_idx"] = merged_df["name"].apply(_get_idx)
+        merged_df = merged_df[merged_df["_temp_idx"] < expected_total].drop(
+            columns=["_temp_idx"]
+        )
+
+    if merged_df.empty:
+        return
+
+    merged_df = convert_strlist_col(merged_df)
+    merged_df = merged_df.dropna(axis=1, how="all")
 
     merged_df.to_csv(os.path.join(final_dir, "all_summary.csv"), index=False)
 
