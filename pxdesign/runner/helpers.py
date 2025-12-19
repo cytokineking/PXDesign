@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from glob import glob
 from pathlib import Path
 
@@ -556,7 +557,36 @@ def save_difficulty_fig(df, mode, save_dir, use_template=False):
         subprocess.run(cmd, check=True)
 
 
-def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final_dir: str):
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_json(path: str) -> dict | None:
+    try:
+        with open(path, "r") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def save_top_designs(
+    p,
+    configs,
+    orig_seqs,
+    use_template: bool = False,
+    *,
+    final_dir: str,
+    results_dir: str,
+):
     """
     Collect all sample-level CSVs, decide which ranking mode to use, and
     write out top designs + difficulty figure.
@@ -572,7 +602,8 @@ def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final
       5) Serialize designs via `process_preview_results` or `process_extended_results`.
       6) Call `save_difficulty_fig` with the actual mode used.
     """
-    output_dir = os.path.join(configs.dump_dir, "design_outputs")
+    # results_dir is versioned (results/, results_v2/, ...)
+    output_dir = str(results_dir)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(final_dir, exist_ok=True)
 
@@ -580,6 +611,25 @@ def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final
     merged_df = collect_sample_csvs(configs.dump_dir)
     if merged_df.empty:
         return
+
+    task_names = sorted(set(merged_df.get("task_name", [])))
+    run_indices = sorted(set(int(x) for x in merged_df.get("run_idx", []).unique()))
+
+    # Write a manifest early so incomplete finalizations are detectable.
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    _atomic_write_json(
+        manifest_path,
+        {
+            "status": "in_progress",
+            "created_at": _iso_now(),
+            "completed_at": None,
+            "results_dir": os.path.basename(output_dir.rstrip(os.sep)),
+            "dump_dir": str(configs.dump_dir),
+            "n_sample": int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+            "tasks": task_names,
+            "runs_included": [int(r) for r in run_indices],
+        },
+    )
 
     # Respect Input: Filter designs by index to match current N_sample
     expected_total = int(getattr(configs.sample_diffusion, "N_sample", 0) or 0)
@@ -602,48 +652,124 @@ def save_top_designs(p, configs, orig_seqs, use_template: bool = False, *, final
     merged_df = convert_strlist_col(merged_df)
     merged_df = merged_df.dropna(axis=1, how="all")
 
-    merged_df.to_csv(os.path.join(final_dir, "all_summary.csv"), index=False)
+    # ----------------------------
+    # Overall analysis (all runs)
+    # ----------------------------
+    overall_dir = os.path.join(output_dir, "analysis", "overall")
+    os.makedirs(overall_dir, exist_ok=True)
+    merged_df.to_csv(os.path.join(overall_dir, "all_summary.csv"), index=False)
 
-    # Decide ranking mode based on presence of PTX columns
-    mode_used = infer_mode_from_df(merged_df)
+    # ----------------------------
+    # Per-run summaries (internal + snapshot copies)
+    # ----------------------------
+    by_run_root = os.path.join(output_dir, "analysis", "by_run")
+    os.makedirs(by_run_root, exist_ok=True)
 
-    if mode_used == "preview":
-        pre_filtered = pre_filter_preview(
-            merged_df,
-            min_total_return=p["min_total_return"],
-            max_success_return=p["max_success_return"],
-            rmsd_col="af2_complex_pred_design_rmsd",
-        )
-        pre_filtered.to_csv(
-            os.path.join(final_dir, "filtered_summary.csv"), index=False
-        )
+    def _select_for_task(df_task: pd.DataFrame) -> tuple[str, pd.DataFrame]:
+        """
+        Return (mode_used, selected_df) for a single task dataframe.
+        The returned DataFrame includes a 1-based 'rank' column.
+        """
+        mode = infer_mode_from_df(df_task)
+        if mode == "preview":
+            selected = pre_filter_preview(
+                df_task,
+                min_total_return=p["min_total_return"],
+                max_success_return=p["max_success_return"],
+                rmsd_col="af2_complex_pred_design_rmsd",
+            )
+        elif mode == "extended":
+            selected = pre_filter_extended(
+                df_task,
+                min_total_return=p["min_total_return"],
+                max_success_return=p["max_success_return"],
+                w_af2=p["extended_w_af2"],
+                w_ptx=p["extended_w_ptx"],
+            )
+        else:
+            raise ValueError(f"Unknown mode={mode!r}")
+        return mode, selected
 
-        save_dir = process_preview_results(pre_filtered, configs.dump_dir, output_dir)
+    # Run-level (aggregated across tasks)
+    for rid in sorted(set(int(x) for x in merged_df["run_idx"].unique())):
+        run_df = merged_df[merged_df["run_idx"] == int(rid)].copy()
+        if run_df.empty:
+            continue
 
-    elif mode_used == "extended":
-        pre_filtered = pre_filter_extended(
-            merged_df,
-            min_total_return=p["min_total_return"],
-            max_success_return=p["max_success_return"],
-            w_af2=p["extended_w_af2"],
-            w_ptx=p["extended_w_ptx"],
-        )
-        pre_filtered.to_csv(
-            os.path.join(final_dir, "filtered_summary.csv"), index=False
-        )
+        run_final_dir = os.path.join(configs.dump_dir, "runs", f"run_{int(rid):03d}", "final")
+        os.makedirs(run_final_dir, exist_ok=True)
 
-        save_dir = process_extended_results(
-            pre_filtered,
-            configs.dump_dir,
-            output_dir,
-            orig_seqs=list(orig_seqs.values())[0],
-            configs_eval=configs.eval,
-        )
-    else:
-        raise ValueError(f"Unknown mode_used={mode_used!r}")
+        run_df.to_csv(os.path.join(run_final_dir, "run_all_summary.csv"), index=False)
 
-    # Save difficulty figure based on the mode actually used
-    save_difficulty_fig(merged_df, mode_used, save_dir, use_template)
+        # Run-filtered summary: apply selection per task, then concatenate.
+        run_selected_parts: list[pd.DataFrame] = []
+        for t in sorted(set(run_df["task_name"].unique())):
+            df_task = run_df[run_df["task_name"] == t].copy()
+            if df_task.empty:
+                continue
+            _, sel = _select_for_task(df_task)
+            run_selected_parts.append(sel)
+        run_filtered_df = pd.concat(run_selected_parts, ignore_index=True) if run_selected_parts else pd.DataFrame()
+        run_filtered_df.to_csv(os.path.join(run_final_dir, "run_filtered_summary.csv"), index=False)
+
+        # Snapshot copies
+        run_snap_dir = os.path.join(by_run_root, f"run_{int(rid):03d}")
+        os.makedirs(run_snap_dir, exist_ok=True)
+        run_df.to_csv(os.path.join(run_snap_dir, "run_all_summary.csv"), index=False)
+        run_filtered_df.to_csv(os.path.join(run_snap_dir, "run_filtered_summary.csv"), index=False)
+
+    # ----------------------------
+    # Overall filtered (selection) + serialize winners to results/
+    # ----------------------------
+    selected_all_parts: list[pd.DataFrame] = []
+    for task_name in sorted(set(merged_df["task_name"].unique())):
+        df_task = merged_df[merged_df["task_name"] == task_name].copy()
+        if df_task.empty:
+            continue
+
+        mode_used, selected_df = _select_for_task(df_task)
+        selected_all_parts.append(selected_df)
+
+        # Write per-task outputs under results/<task_name>/
+        task_dir = os.path.join(output_dir, task_name)
+        os.makedirs(task_dir, exist_ok=True)
+
+        # Meta info for UI/consumers (scoped to this results version)
+        meta_info = {"mode": "Extended" if mode_used == "extended" else "Preview"}
+        if mode_used == "extended":
+            meta_info["protenix"] = "Protenix-Mini-Templ" if bool(use_template) else "Protenix"
+        _atomic_write_json(os.path.join(task_dir, "task_info.json"), meta_info)
+
+        # Serialize selected designs (CIFs) into results dir
+        if mode_used == "preview":
+            _ = process_preview_results(selected_df, configs.dump_dir, output_dir)
+        else:
+            # orig_seqs is a dict keyed by task_name in pipeline v2
+            orig_seqs_task = orig_seqs.get(task_name) if isinstance(orig_seqs, dict) else orig_seqs
+            _ = process_extended_results(
+                selected_df,
+                configs.dump_dir,
+                output_dir,
+                orig_seqs=orig_seqs_task,
+                configs_eval=configs.eval,
+            )
+
+        # Difficulty figure goes under results/<task>/plots/
+        plots_dir = os.path.join(task_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        save_difficulty_fig(df_task, mode_used, plots_dir, use_template)
+
+    filtered_overall = (
+        pd.concat(selected_all_parts, ignore_index=True) if selected_all_parts else pd.DataFrame()
+    )
+    filtered_overall.to_csv(os.path.join(overall_dir, "filtered_summary.csv"), index=False)
+
+    # Mark manifest completed
+    manifest = _read_json(manifest_path) if os.path.exists(manifest_path) else {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    manifest.update({"status": "completed", "completed_at": _iso_now()})
+    _atomic_write_json(manifest_path, manifest)
 
     # Clean unnecessary files
     cleanup_outputs(configs.dump_dir)

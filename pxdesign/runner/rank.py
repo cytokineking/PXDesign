@@ -23,7 +23,7 @@ It reads:
 
 Then it writes:
 - final summaries under: <dump_dir>/runs/run_XXX/final/
-- selected design outputs under: <dump_dir>/design_outputs/
+- versioned results snapshots under: <dump_dir>/results/, results_v2/, ...
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from pathlib import Path
 from protenix.utils.distributed import DIST_WRAPPER
 
 from pxdesign.runner.helpers import save_top_designs
-from pxdesign.runner.pipeline import parse_pipeline_args
+from pxdesign.runner.pipeline import allocate_results_dir, parse_pipeline_args
 from pxdesign.utils.heartbeat import HeartbeatReporter
 from pxdesign.utils.infer import get_configs
 from pxdesign.utils.pipeline import check_tool_weights
@@ -131,6 +131,8 @@ def main(argv=None) -> None:
     final_dir = os.path.join(dump_dir, "runs", f"run_{int(run_id):03d}", "final")
     os.makedirs(final_dir, exist_ok=True)
 
+    results_dir = allocate_results_dir(dump_dir)
+
     # We do not attempt to infer use_template here; it only affects the UI fig.
     save_top_designs(
         p,
@@ -138,6 +140,7 @@ def main(argv=None) -> None:
         orig_seqs,
         use_template=False,
         final_dir=final_dir,
+        results_dir=results_dir,
     )
 
     if hb is not None:

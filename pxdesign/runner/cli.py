@@ -409,7 +409,7 @@ def rank(ctx: click.Context, dump_dir: str, run_id: int | None) -> None:
 
     and writes:
         <dump_dir>/runs/run_XXX/final/*
-        <dump_dir>/design_outputs/<task>/*
+        <dump_dir>/results/<task>/* (or results_v2/, results_v3/, ...)
     """
     from . import rank as _rank
 

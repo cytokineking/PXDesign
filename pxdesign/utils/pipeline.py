@@ -31,10 +31,11 @@ from protenix.data.parser import MMCIFParser
 
 from pxdesign.data.utils import CIFWriter, pdb_to_cif
 
-# -------- Global subdir constants (used everywhere) --------
-ORIG_SUBDIR = os.path.join("orig_designed")
-AF2_SUBDIR = os.path.join("passing-AF2-IG-easy")
-PTX_SUBDIR = os.path.join("passing-Protenix-basic")
+# -------- Results subdir constants (user-facing) --------
+# These are relative to the per-task results directory (<results>/<task_name>/).
+ORIG_SUBDIR = os.path.join("structures", "orig")
+AF2_SUBDIR = os.path.join("structures", "af2")
+PTX_SUBDIR = os.path.join("structures", "ptx")
 
 
 # -------- Small general helpers --------

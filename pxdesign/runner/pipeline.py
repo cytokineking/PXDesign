@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,6 +97,42 @@ def _atomic_write_json(path: str | Path, data: Any) -> None:
 
 def _run_dir(dump_dir: str, run_id: int) -> str:
     return os.path.join(dump_dir, "runs", f"run_{int(run_id):03d}")
+
+
+def _results_dir(dump_dir: str, version: int) -> str:
+    if int(version) <= 1:
+        return os.path.join(dump_dir, "results")
+    return os.path.join(dump_dir, f"results_v{int(version)}")
+
+
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def allocate_results_dir(dump_dir: str) -> str:
+    """
+    Choose a versioned results directory.
+
+    - First finalization writes to <dump_dir>/results/
+    - Subsequent finalizations write to <dump_dir>/results_v2/, results_v3/, ...
+    - If an existing results_vX exists but is not marked completed, reuse it.
+    """
+    for v in range(1, 10_000):
+        p = _results_dir(dump_dir, v)
+        if not os.path.exists(p):
+            return p
+        manifest = _read_json(os.path.join(p, "manifest.json"))
+        if manifest is None:
+            # unknown/incomplete directory; reuse rather than creating endless versions
+            return p
+        if str(manifest.get("status", "")).lower() != "completed":
+            return p
+    raise RuntimeError("Too many results_v* directories; please clean up old results folders.")
 
 
 def _diffusion_struct_dir(dump_dir: str, run_id: int, task_name: str) -> str:
@@ -680,7 +717,27 @@ def main(argv=None):
                     if not os.path.isdir(struct_dir):
                         logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
                         continue
-                    pdb_dir, pdb_names, cond_chains, binder_chains = convert_cifs_to_pdbs(struct_dir)
+                    # CIF->PDB conversion is eval scratch; keep diffusion/structures clean.
+                    cache_cif_dir = os.path.join(
+                        task_eval_dir,
+                        "_cache",
+                        "cif_to_pdb",
+                        task_name,
+                    )
+                    os.makedirs(cache_cif_dir, exist_ok=True)
+
+                    # Materialize only the requested CIFs into cache (hardlink if possible).
+                    for i in sorted(done):
+                        src = os.path.join(struct_dir, f"{task_name}_sample_{int(i):06d}.cif")
+                        dst = os.path.join(cache_cif_dir, os.path.basename(src))
+                        if os.path.exists(dst):
+                            continue
+                        try:
+                            os.link(src, dst)
+                        except Exception:
+                            shutil.copy(src, dst)
+
+                    pdb_dir, pdb_names, cond_chains, binder_chains = convert_cifs_to_pdbs(cache_cif_dir)
 
                     # Respect Input: Filter to only include indices requested in this session
                     pdb_names = [
@@ -791,23 +848,14 @@ def main(argv=None):
         final_dir = _final_dir(configs.dump_dir, finished_run_id)
         os.makedirs(final_dir, exist_ok=True)
 
-        # Save meta info for UI/consumers
-        if task_names:
-            meta_info = {"mode": "Extended" if use_ptx_filter else "Preview"}
-            if use_ptx_filter:
-                meta_info["protenix"] = "Protenix-Mini-Templ" if last_use_target_template else "Protenix"
-            for t in task_names:
-                out_task_dir = os.path.join(configs.dump_dir, "design_outputs", t)
-                os.makedirs(out_task_dir, exist_ok=True)
-                with open(os.path.join(out_task_dir, "task_info.json"), "w") as f:
-                    json.dump(meta_info, f, indent=2)
-
+        results_dir = allocate_results_dir(str(configs.dump_dir))
         save_top_designs(
             p,
             configs,
             last_orig_seqs,
             use_template=bool(last_use_target_template),
             final_dir=str(final_dir),
+            results_dir=str(results_dir),
         )
 
         _atomic_write_json(
