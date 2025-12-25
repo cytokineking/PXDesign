@@ -169,3 +169,4 @@ wandb/
 output*/
 release_data/
 tool_weights/
+docs/

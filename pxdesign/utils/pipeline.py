@@ -245,6 +245,11 @@ def save_ptx_docked(
 
 def trim_summary_df(df: pd.DataFrame) -> pd.DataFrame:
     """Keep a curated subset of columns and rename AF2 metrics if present."""
+    # Add length column derived from sequence
+    if "sequence" in df.columns:
+        df = df.copy()
+        df["length"] = df["sequence"].apply(len)
+
     base_metrics = [
         "plddt",
         "ptm_binder",
@@ -260,6 +265,8 @@ def trim_summary_df(df: pd.DataFrame) -> pd.DataFrame:
         [
             "rank",
             "task_name",
+            "seq_idx",
+            "length",
             "sequence",
             "af2_easy_success",
             "af2_opt_success",

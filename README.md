@@ -95,6 +95,7 @@ Inside the container:
 git clone https://github.com/bytedance/PXDesign.git
 cd PXDesign
 pip install --upgrade pip
+pip install -e ./PXDesignBench
 pip install -e .
 ```
 </details>
@@ -114,7 +115,7 @@ Run the script ``install.sh`` to set up an environment and install all dependenc
 1. Create a dedicated conda / mamba / micromamba environment  
 2. Install **PyTorch** matching your specified CUDA version  
 3. Install **Protenix**
-4. Install **PXDesignBench**
+4. Install **PXDesignBench** (bundled in this repo)
 5. Install **PXDesign**
 6. Run **basic import sanity checks**  
 

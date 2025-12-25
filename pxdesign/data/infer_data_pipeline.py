@@ -14,6 +14,7 @@
 
 import json
 import logging
+import random
 import sys
 import time
 import traceback
@@ -353,6 +354,9 @@ class InferenceDataset(Dataset):
         for gen_seq_dict in json_dict.get("generation", {}):
             assert "sequence" not in gen_seq_dict
             length = gen_seq_dict["length"]
+            # Support length range: {"min": X, "max": Y}
+            if isinstance(length, dict):
+                length = random.randint(length["min"], length["max"])
             count = gen_seq_dict["count"]
             one_dict = {
                 "proteinChain": {

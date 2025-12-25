@@ -51,6 +51,7 @@ import torch
 from protenix.config import save_config
 from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.seed import seed_everything
+from pxdbench.aggregate import aggregate_binder_eval
 from pxdbench.run import run_task
 from pxdbench.utils import convert_cifs_to_pdbs, str2bool
 
@@ -223,6 +224,95 @@ def _count_success_from_csv(csv_path: str) -> int:
         return 0
     except Exception:
         return 0
+
+
+def _default_analysis_workers() -> int:
+    cpu_count = os.cpu_count() or 1
+    return min(max(4, cpu_count - 2), 32)
+
+
+def _resolve_analysis_workers(value: int | None) -> int:
+    if value is None:
+        return _default_analysis_workers()
+    try:
+        val = int(value)
+    except Exception:
+        return _default_analysis_workers()
+    if val <= 0:
+        return _default_analysis_workers()
+    return val
+
+
+def _model_ids_from_cfg(eval_cfg) -> list[int]:
+    model_ids: list[int] = []
+    try:
+        model_ids = list(eval_cfg.tools.af2.model_ids)
+    except Exception:
+        try:
+            model_ids = list(eval_cfg.tools.af2.get("model_ids", []))
+        except Exception:
+            model_ids = []
+    if not model_ids:
+        model_ids = [0]
+    return [int(x) for x in model_ids]
+
+
+def _has_af2_outputs(
+    af2_dir: str, name: str, seq_idx: int, model_ids: list[int], monomer: bool = False
+) -> bool:
+    suffix = "_MONOMER_ONLY" if monomer else ""
+    for model_id in model_ids:
+        model_num = int(model_id) + 1
+        fp = os.path.join(
+            af2_dir, f"{name}_seq{int(seq_idx)}{suffix}_model{model_num}.json"
+        )
+        if not os.path.exists(fp):
+            return False
+    return True
+
+
+def _has_ptx_outputs(ptx_dir: str, name: str, seq_idx: int, seed: int) -> bool:
+    pred_dir = Path(ptx_dir) / f"{name}_seq{int(seq_idx)}" / f"seed_{int(seed)}" / "predictions"
+    if not pred_dir.is_dir():
+        return False
+    return bool(list(pred_dir.glob("*_summary_confidence_sample_0.json")))
+
+
+def _pending_pdb_names(
+    pdb_names: list[str],
+    task_eval_dir: str,
+    eval_cfg,
+    seed: int,
+) -> list[str]:
+    af2_dir = os.path.join(task_eval_dir, "af2_pred")
+    ptx_dir = os.path.join(task_eval_dir, "ptx_pred")
+    ptx_mini_dir = os.path.join(task_eval_dir, "ptx_mini_pred")
+    model_ids = _model_ids_from_cfg(eval_cfg)
+    num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
+
+    pending = []
+    for name in pdb_names:
+        complete = True
+        for seq_idx in range(num_seqs):
+            if getattr(eval_cfg, "eval_complex", False):
+                if not _has_af2_outputs(af2_dir, name, seq_idx, model_ids, monomer=False):
+                    complete = False
+                    break
+            if getattr(eval_cfg, "eval_binder_monomer", False):
+                if not _has_af2_outputs(af2_dir, name, seq_idx, model_ids, monomer=True):
+                    complete = False
+                    break
+            if getattr(eval_cfg, "eval_protenix_mini", False):
+                if not _has_ptx_outputs(ptx_mini_dir, name, seq_idx, seed):
+                    complete = False
+                    break
+            if getattr(eval_cfg, "eval_protenix", False):
+                if not _has_ptx_outputs(ptx_dir, name, seq_idx, seed):
+                    complete = False
+                    break
+        if not complete:
+            pending.append(name)
+    return pending
 
 
 # -----------------------------------------------------------------------------
@@ -484,6 +574,12 @@ def parse_pipeline_args(argv=None):
         default=1,
         help="Min number of total successes required to trigger early-stop.",
     )
+    parser.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=0,
+        help="CPU workers for post-eval analysis (0=auto).",
+    )
 
     overridden_keys = _get_overridden_keys(argv)
     pipeline_args, remaining = parser.parse_known_args(argv)
@@ -545,6 +641,7 @@ class DesignPipeline(InferenceRunner):
 
 def main(argv=None):
     configs, p = parse_args(argv)
+    p["analysis_workers"] = _resolve_analysis_workers(p.get("analysis_workers"))
 
     os.environ.setdefault("PXDESIGN_STATUS_DIR", str(configs.dump_dir))
     os.environ["PXDESIGN_STAGE"] = "startup"
@@ -674,180 +771,206 @@ def main(argv=None):
             torch.distributed.barrier()
 
         # --------------------
-        # Evaluation (rank 0)
+        # Evaluation (all ranks)
         # --------------------
+        os.environ["PXDESIGN_STAGE"] = "evaluation"
+        hb = HeartbeatReporter.from_env()
+        if DIST_WRAPPER.rank == 0 and hb is not None:
+            hb.update(
+                produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                extra={"stage_transition": "evaluation", "run_id": int(run_id)},
+                force=True,
+            )
+
+        # Optional: target-template decision for PTX filter
+        if runner.use_ptx_filter:
+            use_target_template = None
+            if DIST_WRAPPER.rank == 0 and last_orig_seqs:
+                first_task = list(last_orig_seqs.keys())[0]
+                gt_cif_path = os.path.join(
+                    _diffusion_struct_dir(configs.dump_dir, run_id, first_task),
+                    f"{first_task}_sample_{0:06d}.cif",
+                )
+                target_pred_dir = os.path.join(
+                    _eval_task_dir(configs.dump_dir, run_id, first_task),
+                    "target_pred",
+                )
+                use_target_template = use_target_template_or_not(
+                    configs.eval,
+                    p,
+                    gt_cif_path,
+                    last_orig_seqs.get(first_task),
+                    first_task,
+                    target_pred_dir,
+                    device="cuda:0",
+                    seed=run_seed,
+                )
+            last_use_target_template = bool(use_target_template) if DIST_WRAPPER.rank == 0 else False
+        else:
+            last_use_target_template = False
+
+        if DIST_WRAPPER.world_size > 1:
+            tmpl_list = DIST_WRAPPER.all_gather_object(
+                last_use_target_template if DIST_WRAPPER.rank == 0 else None
+            )
+            last_use_target_template = [x for x in tmpl_list if x is not None][0]
+
+        if last_use_target_template:
+            configs.eval.binder.tools.ptx.use_template = True
+            configs.eval.binder.tools.ptx.use_msa = False
+            configs.eval.binder.tools.ptx.model_name = "protenix_mini_tmpl_v0.5.0"
+            logger.info("[pipeline] Using target template in Protenix filter")
+
+        eval_root = os.path.join(run_dir, "eval")
+        os.makedirs(eval_root, exist_ok=True)
+        eval_state_path = os.path.join(eval_root, "eval_state.json")
+        eval_state = {}
+        if DIST_WRAPPER.rank == 0 and os.path.exists(eval_state_path):
+            try:
+                eval_state = json.loads(Path(eval_state_path).read_text())
+            except Exception:
+                eval_state = {}
+
+        eval_tasks_state: dict[str, dict] = dict(eval_state.get("tasks") or {}) if DIST_WRAPPER.rank == 0 else {}
+        expected_total = int(getattr(configs.sample_diffusion, "N_sample", 0) or 0)
+        task_eval_meta: list[dict[str, Any]] = []
+
+        for task_name in sorted(active_tasks):
+            struct_dir = _diffusion_struct_dir(configs.dump_dir, run_id, task_name)
+            done = _existing_indices(struct_dir, task_name)
+            done = {i for i in done if 0 <= i < expected_total}
+            diffusion_count = int(len(done))
+
+            task_eval_dir = _eval_task_dir(configs.dump_dir, run_id, task_name)
+            os.makedirs(task_eval_dir, exist_ok=True)
+
+            if not os.path.isdir(struct_dir):
+                if DIST_WRAPPER.rank == 0:
+                    logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
+                continue
+
+            # CIF->PDB conversion is eval scratch; keep diffusion/structures clean.
+            cache_cif_dir = os.path.join(
+                task_eval_dir,
+                "_cache",
+                "cif_to_pdb",
+                task_name,
+            )
+
+            if DIST_WRAPPER.rank == 0:
+                os.makedirs(cache_cif_dir, exist_ok=True)
+                for i in sorted(done):
+                    src = os.path.join(struct_dir, f"{task_name}_sample_{int(i):06d}.cif")
+                    dst = os.path.join(cache_cif_dir, os.path.basename(src))
+                    if os.path.exists(dst):
+                        continue
+                    try:
+                        os.link(src, dst)
+                    except Exception:
+                        shutil.copy(src, dst)
+
+            if DIST_WRAPPER.world_size > 1:
+                torch.distributed.barrier()
+
+            if DIST_WRAPPER.rank == 0:
+                pdb_dir, pdb_names, cond_chains, binder_chains = convert_cifs_to_pdbs(cache_cif_dir)
+                pdb_names = [
+                    n
+                    for n in pdb_names
+                    if any(f"_sample_{i:06d}" in n for i in done)
+                ]
+            else:
+                pdb_dir, pdb_names, cond_chains, binder_chains = None, None, None, None
+
+            if DIST_WRAPPER.world_size > 1:
+                shared = DIST_WRAPPER.all_gather_object(
+                    (pdb_dir, pdb_names, cond_chains, binder_chains) if DIST_WRAPPER.rank == 0 else None
+                )
+                pdb_dir, pdb_names, cond_chains, binder_chains = [
+                    x for x in shared if x is not None
+                ][0]
+
+            if not pdb_names:
+                if DIST_WRAPPER.rank == 0:
+                    logger.info(
+                        f"[pipeline] No matching designs for {task_name} in index range "
+                        f"0..{expected_total-1}. Skipping eval."
+                    )
+                continue
+
+            pending_names = _pending_pdb_names(
+                pdb_names,
+                task_eval_dir,
+                configs.eval.binder,
+                run_seed,
+            )
+            my_pdb_names = pending_names[DIST_WRAPPER.rank :: DIST_WRAPPER.world_size]
+
+            if my_pdb_names:
+                eval_input = {
+                    "task": "binder",
+                    "name": task_name,
+                    "pdb_dir": pdb_dir,
+                    "pdb_names": my_pdb_names,
+                    "cond_chains": cond_chains,
+                    "binder_chains": binder_chains,
+                    "out_dir": task_eval_dir,
+                    "orig_seqs": last_orig_seqs.get(task_name),
+                    "pred_only": True,
+                }
+                run_task(eval_input, configs.eval, device_id=DIST_WRAPPER.local_rank, seed=run_seed)
+
+                if DIST_WRAPPER.rank == 0 and hb is not None:
+                    hb.update(
+                        produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                        expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                        extra={"eval_task": task_name, "eval_step": "run_task_complete"},
+                        force=True,
+                    )
+
+            task_eval_meta.append(
+                {
+                    "task_name": task_name,
+                    "task_eval_dir": task_eval_dir,
+                    "pdb_dir": pdb_dir,
+                    "pdb_names": pdb_names,
+                    "cond_chains": cond_chains,
+                    "binder_chains": binder_chains,
+                    "diffusion_count": diffusion_count,
+                }
+            )
+
+        if DIST_WRAPPER.world_size > 1:
+            torch.distributed.barrier()
+
         if DIST_WRAPPER.rank == 0:
-            os.environ["PXDESIGN_STAGE"] = "evaluation"
-            hb = HeartbeatReporter.from_env()
-            if hb is not None:
-                hb.update(
-                    produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                    expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                    extra={"stage_transition": "evaluation", "run_id": int(run_id)},
-                    force=True,
+            for meta in task_eval_meta:
+                task_name = meta["task_name"]
+                task_eval_dir = meta["task_eval_dir"]
+                pdb_dir = meta["pdb_dir"]
+                pdb_names = meta["pdb_names"]
+                cond_chains = meta["cond_chains"]
+                binder_chains = meta["binder_chains"]
+                diffusion_count = meta["diffusion_count"]
+
+                if not pdb_names:
+                    continue
+
+                aggregate_binder_eval(
+                    task_name=task_name,
+                    eval_dir=task_eval_dir,
+                    pdb_dir=pdb_dir,
+                    pdb_names=pdb_names,
+                    cond_chains=cond_chains,
+                    binder_chains=binder_chains,
+                    cfg=configs.eval.binder,
+                    seed=run_seed,
+                    analysis_workers=int(p.get("analysis_workers")),
                 )
 
-            # Optional: target-template decision for PTX filter
-            if runner.use_ptx_filter:
-                use_target_template = None
-                if last_orig_seqs:
-                    first_task = list(last_orig_seqs.keys())[0]
-                    gt_cif_path = os.path.join(
-                        _diffusion_struct_dir(configs.dump_dir, run_id, first_task),
-                        f"{first_task}_sample_{0:06d}.cif",
-                    )
-                    target_pred_dir = os.path.join(
-                        _eval_task_dir(configs.dump_dir, run_id, first_task),
-                        "target_pred",
-                    )
-                    use_target_template = use_target_template_or_not(
-                        configs.eval,
-                        p,
-                        gt_cif_path,
-                        last_orig_seqs.get(first_task),
-                        first_task,
-                        target_pred_dir,
-                        device="cuda:0",
-                        seed=run_seed,
-                    )
-                last_use_target_template = bool(use_target_template)
-                if last_use_target_template:
-                    configs.eval.binder.tools.ptx.use_template = True
-                    configs.eval.binder.tools.ptx.use_msa = False
-                    configs.eval.binder.tools.ptx.model_name = "protenix_mini_tmpl_v0.5.0"
-                    logger.info("[pipeline] Using target template in Protenix filter")
-            else:
-                last_use_target_template = False
-
-            # Eval staleness: rerun if diffusion count changed since last eval
-            eval_root = os.path.join(run_dir, "eval")
-            os.makedirs(eval_root, exist_ok=True)
-            eval_state_path = os.path.join(eval_root, "eval_state.json")
-            eval_state = {}
-            if os.path.exists(eval_state_path):
-                try:
-                    eval_state = json.loads(Path(eval_state_path).read_text())
-                except Exception:
-                    eval_state = {}
-
-            eval_tasks_state: dict[str, dict] = dict(eval_state.get("tasks") or {})
-
-            eval_results: list[dict] = []
-            expected_total = int(getattr(configs.sample_diffusion, "N_sample", 0) or 0)
-
-            for task_name in sorted(active_tasks):
-                struct_dir = _diffusion_struct_dir(configs.dump_dir, run_id, task_name)
-                done = _existing_indices(struct_dir, task_name)
-                done = {i for i in done if 0 <= i < expected_total}
-                diffusion_count = int(len(done))
-
-                task_eval_dir = _eval_task_dir(configs.dump_dir, run_id, task_name)
-                os.makedirs(task_eval_dir, exist_ok=True)
                 csv_path = os.path.join(task_eval_dir, "sample_level_output.csv")
-
-                prev = (eval_tasks_state.get(task_name) or {}).get("diffusion_cif_count")
-                stale = (not os.path.exists(csv_path)) or (prev is None) or (int(prev) != diffusion_count)
-
-                if stale:
-                    if not os.path.isdir(struct_dir):
-                        logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
-                        continue
-                    # CIF->PDB conversion is eval scratch; keep diffusion/structures clean.
-                    cache_cif_dir = os.path.join(
-                        task_eval_dir,
-                        "_cache",
-                        "cif_to_pdb",
-                        task_name,
-                    )
-                    os.makedirs(cache_cif_dir, exist_ok=True)
-
-                    # Materialize only the requested CIFs into cache (hardlink if possible).
-                    for i in sorted(done):
-                        src = os.path.join(struct_dir, f"{task_name}_sample_{int(i):06d}.cif")
-                        dst = os.path.join(cache_cif_dir, os.path.basename(src))
-                        if os.path.exists(dst):
-                            continue
-                        try:
-                            os.link(src, dst)
-                        except Exception:
-                            shutil.copy(src, dst)
-
-                    pdb_dir, pdb_names, cond_chains, binder_chains = convert_cifs_to_pdbs(cache_cif_dir)
-
-                    # Respect Input: Filter to only include indices requested in this session
-                    pdb_names = [
-                        n
-                        for n in pdb_names
-                        if any(f"_sample_{i:06d}" in n for i in done)
-                    ]
-                    if not pdb_names:
-                        logger.info(f"[pipeline] No matching designs for {task_name} in index range 0..{expected_total-1}. Skipping eval.")
-                        continue
-
-                    # Resume logic: Filter out samples that already have Protenix predictions
-                    # This allows interrupted evaluation to skip already-completed samples
-                    ptx_pred_dir = os.path.join(task_eval_dir, "ptx_pred")
-                    completed_ptx = _get_completed_ptx_samples(ptx_pred_dir, run_seed)
-                    if completed_ptx:
-                        original_count = len(pdb_names)
-                        # pdb_names are like "task_sample_000000"
-                        # ptx predictions use "task_sample_000000_seq0"
-                        pdb_names = [
-                            n for n in pdb_names
-                            if f"{n}_seq0" not in completed_ptx
-                        ]
-                        skipped = original_count - len(pdb_names)
-                        if skipped > 0:
-                            logger.info(
-                                f"[pipeline] Skipping {skipped} samples with existing "
-                                f"Protenix predictions for {task_name}"
-                            )
-                    
-                    if not pdb_names:
-                        logger.info(
-                            f"[pipeline] All samples for {task_name} already have "
-                            f"Protenix predictions. Skipping eval."
-                        )
-                        continue
-
-                    eval_input = {
-                        "task": "binder",
-                        "name": task_name,
-                        "pdb_dir": pdb_dir,
-                        "pdb_names": pdb_names,
-                        "cond_chains": cond_chains,
-                        "binder_chains": binder_chains,
-                        "out_dir": task_eval_dir,
-                        "orig_seqs": last_orig_seqs.get(task_name),
-                    }
-                    r = run_task(eval_input, configs.eval, device_id=0, seed=run_seed)
-                    eval_results.append(r)
-
-                    # Keep heartbeat alive during long evaluation subprocesses
-                    # This prevents the manager from thinking PXDesign is stalled
-                    if hb is not None:
-                        hb.update(
-                            produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                            expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                            extra={"eval_task": task_name, "eval_step": "run_task_complete"},
-                            force=True,
-                        )
-
-                # success accounting (per-run)
-                run_success = 0
-                try:
-                    if stale and eval_results and isinstance(eval_results[-1], dict):
-                        summary_path = eval_results[-1].get("summary_save_path")
-                        if summary_path and os.path.exists(summary_path):
-                            summary = json.loads(Path(summary_path).read_text())
-                            run_success = int(summary.get("af2_easy_success.count", 0) or 0)
-                        else:
-                            run_success = _count_success_from_csv(csv_path)
-                    else:
-                        run_success = _count_success_from_csv(csv_path)
-                except Exception:
-                    run_success = _count_success_from_csv(csv_path)
-
+                run_success = _count_success_from_csv(csv_path)
                 cumulative_success[task_name] = cumulative_success.get(task_name, 0) + int(run_success)
 
                 eval_tasks_state[task_name] = {

@@ -44,10 +44,17 @@ def parse_yaml_to_json(yaml_path, json_path=None):
     default_name = os.path.splitext(os.path.basename(yaml_path))[0]
     task_name = cfg.get("task_name", default_name)
 
-    # Binder length (Required)
+    # Binder length (Required) - supports single int or range "min-max"
     if "binder_length" not in cfg:
         raise ValueError("Missing required field: 'binder_length'")
-    binder_length = int(cfg["binder_length"])
+    binder_length_raw = cfg["binder_length"]
+    if isinstance(binder_length_raw, str) and "-" in binder_length_raw:
+        min_len, max_len = map(int, binder_length_raw.split("-"))
+        if min_len > max_len:
+            raise ValueError(f"Invalid binder_length range: min ({min_len}) > max ({max_len})")
+        binder_length = {"min": min_len, "max": max_len}
+    else:
+        binder_length = int(binder_length_raw)
 
     # --- 2. Target Parsing ---
     target_cfg = cfg.get("target", {})

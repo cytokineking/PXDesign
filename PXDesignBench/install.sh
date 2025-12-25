@@ -2,25 +2,24 @@
 set -euo pipefail
 
 ############################################################
-# PXDesign One-Click Installation Script
+# PXDesignBench One-Click Installation Script
 #
 # This script will:
 #   1. Create a dedicated conda/mamba/micromamba environment
 #   2. Install GPU PyTorch matching a specified CUDA version
-#   3. Install Protenix
-#   4. Install PXDesignBench dependencies
-#   5. Clone PXDesign repo and install
-#   6. Run basic import sanity checks
+#   3. Install Protenix (dev_design_update branch)
+#   4. Clone PXDesignBench repo and install
+#   5. Run basic import sanity checks
 #
 # Supported options:
-#   --env <name>           Conda/mamba environment name (default: pxdesign)
+#   --env <name>           Conda/mamba environment name (default: pxdbench)
 #   --pkg_manager <tool>   conda | mamba | micromamba (default: conda)
 #   --cuda-version <ver>   CUDA version string, e.g. 12.1, 12.2, 12.4
 #                          Required. Must be >= 12.1.
 ############################################################
 
 # Default configuration
-env_name="pxdesign"
+env_name="pxdbench"
 pkg_manager="conda"      # conda | mamba | micromamba
 cuda_version=""          # e.g. 12.1, 12.2, 12.4
 
@@ -62,7 +61,7 @@ while true; do
 done
 
 echo "=================================================="
-echo " PXDesign Installation"
+echo " PXDesignBench Installation"
 echo "   Environment name : ${env_name}"
 echo "   Package manager  : ${pkg_manager}"
 echo "   CUDA version     : ${cuda_version:-<not specified>}"
@@ -197,8 +196,7 @@ else
 
   echo ">>> Activating environment '${env_name}' (${env_tool})"
   # shellcheck disable=SC1090
-  source "${CONDA_BASE}/etc/profile.d/conda.sh"
-  conda activate "${env_name}" || {
+  source "${CONDA_BASE}/bin/activate" "${env_name}" || {
     echo "Error: failed to activate environment ${env_name}"
     exit 1
   }
@@ -237,7 +235,7 @@ if torch.cuda.is_available():
 PYTORCH_CHECK
 
 # ----------------------------------------------------------
-# 2) Install Protenix & PXDesignBench
+# 2) Install Protenix
 # ----------------------------------------------------------
 
 echo ">>> Installing Protenix"
@@ -270,36 +268,8 @@ pip install --no-cache-dir \
   "numpy==1.26.3" \
   || { echo "Error: failed to install numpy 1.26.3."; exit 1; }
 
-echo ">>> Installing PXDesignBench (bundled)"
-pip install -e ./PXDesignBench \
-  || { echo "Error: failed to install PXDesignBench."; exit 1; }
-
-echo ">>> Installing PXDesign"
+echo ">>> Installing PXDesignBench"
 pip install -e .
-
-if [ "${env_tool}" = "micromamba" ]; then
-  micromamba install -c conda-forge cudnn -y || { echo "Error: failed to install cudnn with micromamba."; exit 1; }
-else
-  conda install -c conda-forge cudnn -y || { echo "Error: failed to install cudnn with conda."; exit 1; }
-fi
-
-
-# -------------------------------
-# 3) CUTLASS (for DeepSpeed Evo attention)
-# -------------------------------
-
-# Default to $HOME/cutlass if CUTLASS_PATH is not set by the user
-export CUTLASS_PATH="${CUTLASS_PATH:-$HOME/cutlass}"
-
-echo "[CUTLASS] Using CUTLASS_PATH=${CUTLASS_PATH}"
-
-if [ ! -d "${CUTLASS_PATH}" ]; then
-  echo "[CUTLASS] CUTLASS not found, cloning NVIDIA/cutlass v3.5.1 ..."
-  git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git "${CUTLASS_PATH}"
-else
-  echo "[CUTLASS] Existing CUTLASS directory detected, skipping clone."
-fi
-
 
 ############################################################
 # Sanity checks
@@ -324,8 +294,7 @@ modules = [
     "jax.numpy",
     "colabdesign",
     "protenix",
-    "pxdbench",
-    "pxdesign"
+    "pxdbench"
 ]
 
 for m in modules:
@@ -353,7 +322,7 @@ fi
 
 t=${SECONDS}
 echo "=================================================="
-echo " PXDesign environment setup done!"
+echo " PXDesignBench environment setup done!"
 echo "   Environment name : ${env_name}"
 echo "   Package manager  : ${pkg_manager}"
 echo "   CUDA version     : ${cuda_version} (torch tag: ${torch_tag})"
