@@ -163,6 +163,41 @@ def _existing_indices(struct_dir: str, task_name: str) -> set[int]:
     return out
 
 
+def _get_completed_ptx_samples(ptx_pred_dir: str, seed: int) -> set[str]:
+    """
+    Return set of sample names that have completed Protenix predictions.
+    
+    Checks for the presence of predictions/<name>_seed_<seed>_sample_0.cif
+    under each sample subdirectory in ptx_pred_dir.
+    
+    Args:
+        ptx_pred_dir: Path to the ptx_pred directory (e.g., .../eval/<task>/ptx_pred)
+        seed: The run seed used for predictions
+        
+    Returns:
+        Set of sample names (e.g., {"task_sample_000000_seq0", "task_sample_000001_seq0"})
+        that have completed Protenix predictions.
+    """
+    completed: set[str] = set()
+    if not os.path.isdir(ptx_pred_dir):
+        return completed
+    
+    for sample_dir in Path(ptx_pred_dir).iterdir():
+        if not sample_dir.is_dir() or sample_dir.name.startswith("."):
+            continue
+        if sample_dir.name == "protenix_inputs.json":
+            continue
+        sample_name = sample_dir.name
+        # Check for seed subdirectory and predictions
+        pred_subdir = sample_dir / f"seed_{seed}" / "predictions"
+        if pred_subdir.is_dir():
+            # Check for at least one .cif file (the main output)
+            cifs = list(pred_subdir.glob("*.cif"))
+            if cifs:
+                completed.add(sample_name)
+    return completed
+
+
 def _count_success_from_csv(csv_path: str) -> int:
     """Best-effort: sum af2_easy_success (fallback to 0 if unknown format)."""
     if not os.path.exists(csv_path):
@@ -749,6 +784,32 @@ def main(argv=None):
                         logger.info(f"[pipeline] No matching designs for {task_name} in index range 0..{expected_total-1}. Skipping eval.")
                         continue
 
+                    # Resume logic: Filter out samples that already have Protenix predictions
+                    # This allows interrupted evaluation to skip already-completed samples
+                    ptx_pred_dir = os.path.join(task_eval_dir, "ptx_pred")
+                    completed_ptx = _get_completed_ptx_samples(ptx_pred_dir, run_seed)
+                    if completed_ptx:
+                        original_count = len(pdb_names)
+                        # pdb_names are like "task_sample_000000"
+                        # ptx predictions use "task_sample_000000_seq0"
+                        pdb_names = [
+                            n for n in pdb_names
+                            if f"{n}_seq0" not in completed_ptx
+                        ]
+                        skipped = original_count - len(pdb_names)
+                        if skipped > 0:
+                            logger.info(
+                                f"[pipeline] Skipping {skipped} samples with existing "
+                                f"Protenix predictions for {task_name}"
+                            )
+                    
+                    if not pdb_names:
+                        logger.info(
+                            f"[pipeline] All samples for {task_name} already have "
+                            f"Protenix predictions. Skipping eval."
+                        )
+                        continue
+
                     eval_input = {
                         "task": "binder",
                         "name": task_name,
@@ -761,6 +822,16 @@ def main(argv=None):
                     }
                     r = run_task(eval_input, configs.eval, device_id=0, seed=run_seed)
                     eval_results.append(r)
+
+                    # Keep heartbeat alive during long evaluation subprocesses
+                    # This prevents the manager from thinking PXDesign is stalled
+                    if hb is not None:
+                        hb.update(
+                            produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                            expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                            extra={"eval_task": task_name, "eval_step": "run_task_complete"},
+                            force=True,
+                        )
 
                 # success accounting (per-run)
                 run_success = 0
