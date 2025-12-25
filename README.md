@@ -362,10 +362,17 @@ We **strongly recommend pre-computing MSAs** for each target chain. PXDesign pro
 pxdesign prepare-msa --yaml <input.yaml>
 ```
 
+By default, this command generates MSAs via the **ColabFold MMseqs2 server** (equivalent to `--msa-mode mmseqs`). This writes per-chain MSA directories (each containing `pairing.a3m` and `non_pairing.a3m`) and injects them into your YAML under `target.chains[*].msa`.
+
+To use the Protenix search pipeline instead, run:
+```bash
+pxdesign prepare-msa --yaml <input.yaml> --msa-mode protenix
+```
+
 This command will:
 - Parse the target structure (PDB or CIF) specified in target.file
 - Identify the target chains defined under `target.chains`
-- Locate or generate cached MSAs using Protenix’s MSA search pipeline
+- Populate MSAs from Protenix search (`--msa-mode protenix`) or generate them via ColabFold (`--msa-mode mmseqs`, default)
 - Inject the corresponding MSA directories into:
 
 ```yaml

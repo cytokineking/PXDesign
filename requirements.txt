@@ -2,6 +2,7 @@ PyYaml
 scipy
 ml_collections
 tqdm
+requests
 pandas
 optree
 rdkit
