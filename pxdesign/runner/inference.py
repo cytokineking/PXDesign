@@ -45,6 +45,59 @@ from pxdesign.utils.inputs import process_input_file
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MIN_PER_LEN = 10
+
+
+def _get_length_spec(sample_dict: Mapping[str, Any]) -> Any:
+    for gen_seq_dict in sample_dict.get("generation", []):
+        if "length" in gen_seq_dict:
+            return gen_seq_dict["length"]
+    return None
+
+
+def _build_length_schedule(
+    min_len: int,
+    max_len: int,
+    n_designs: int,
+    *,
+    min_per_len: int = DEFAULT_MIN_PER_LEN,
+) -> list[int]:
+    if n_designs <= 0:
+        return []
+    range_size = int(max_len) - int(min_len) + 1
+    if range_size <= 0:
+        raise ValueError(
+            f"Invalid length range: min_len={min_len}, max_len={max_len}."
+        )
+
+    if n_designs >= min_per_len * range_size:
+        num_lengths = range_size
+    elif n_designs <= range_size:
+        num_lengths = n_designs
+    else:
+        num_lengths = max(1, n_designs // min_per_len)
+
+    if num_lengths <= 1:
+        lengths = [int(round((min_len + max_len) / 2))]
+    else:
+        lengths = [
+            int(min_len + (i * (range_size - 1)) // (num_lengths - 1))
+            for i in range(num_lengths)
+        ]
+
+    base = n_designs // num_lengths
+    rem = n_designs % num_lengths
+    counts = [base + (1 if i < rem else 0) for i in range(num_lengths)]
+    schedule: list[int] = []
+    while len(schedule) < n_designs:
+        for i, length in enumerate(lengths):
+            if counts[i] > 0:
+                schedule.append(int(length))
+                counts[i] -= 1
+                if len(schedule) >= n_designs:
+                    break
+    return schedule
+
 
 class InferenceRunner(object):
     def __init__(self, configs: Any) -> None:
@@ -177,6 +230,29 @@ class InferenceRunner(object):
         os.environ["PXDESIGN_STAGE"] = "diffusion"
         os.environ["PXDESIGN_SEED"] = str(run_seed)
         os.environ["PXDESIGN_GLOBAL_RUN"] = str(run_id)
+
+        expected_total = int(getattr(self.configs.sample_diffusion, "N_sample", 0) or 0)
+        min_per_len = int(
+            os.environ.get(
+                "PXDESIGN_MIN_PER_LEN",
+                getattr(self.configs, "length_min_per_len", DEFAULT_MIN_PER_LEN),
+            )
+        )
+        schedule_path = os.path.join(run_dir, "diffusion", "length_schedule.json")
+        length_schedule: dict[str, Any] = {}
+        schedule_dirty = False
+        if os.path.exists(schedule_path):
+            try:
+                with open(schedule_path, "r") as f:
+                    length_schedule = json.load(f) or {}
+            except Exception as e:
+                logger.info(
+                    f"[Rank {DIST_WRAPPER.rank}] Failed to load length schedule: {e}"
+                )
+                length_schedule = {}
+        length_schedule.setdefault("tasks", {})
+        length_schedule["expected_total"] = int(expected_total)
+        length_schedule["min_per_len"] = int(min_per_len)
         for batch in self.design_test_dl:
             data, atom_array, data_error_message = batch[0]
             try:
@@ -189,10 +265,11 @@ class InferenceRunner(object):
                         f"[Rank {DIST_WRAPPER.rank}] Skip inactive task={sample}"
                     )
                     continue
+                sample_index = int(data["sample_index"])
 
                 os.environ["PXDESIGN_TASK_NAME"] = sample
                 logger.info(
-                    f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] {sample}: "
+                    f"[Rank {DIST_WRAPPER.rank} ({sample_index + 1}/{num_data})] {sample}: "
                     f"N_asym={data['N_asym'].item()}, N_token={data['N_token'].item()}, "
                     f"N_atom={data['N_atom'].item()}, N_msa={data['N_msa'].item()}"
                 )
@@ -236,12 +313,39 @@ class InferenceRunner(object):
                             out.add(int(idx_str))
                     return out
 
-                expected_total = int(
-                    getattr(self.configs.sample_diffusion, "N_sample", 0) or 0
-                )
                 if expected_total <= 0:
                     logger.info(f"[Rank {DIST_WRAPPER.rank}] {sample}: N_sample=0, skip.")
                     continue
+
+                length_by_idx = None
+                length_spec = _get_length_spec(self.dataset.inputs[sample_index])
+                if (
+                    isinstance(length_spec, dict)
+                    and "min" in length_spec
+                    and "max" in length_spec
+                ):
+                    task_entry = length_schedule.get("tasks", {}).get(sample, {})
+                    task_lengths = task_entry.get("lengths")
+                    if (
+                        isinstance(task_lengths, list)
+                        and len(task_lengths) == expected_total
+                    ):
+                        length_by_idx = [int(x) for x in task_lengths]
+                    else:
+                        length_by_idx = _build_length_schedule(
+                            int(length_spec["min"]),
+                            int(length_spec["max"]),
+                            int(expected_total),
+                            min_per_len=min_per_len,
+                        )
+                        length_schedule["tasks"][sample] = {
+                            "min": int(length_spec["min"]),
+                            "max": int(length_spec["max"]),
+                            "lengths": length_by_idx,
+                        }
+                        schedule_dirty = True
+                elif isinstance(length_spec, int):
+                    length_by_idx = [int(length_spec)] * int(expected_total)
 
                 world_size = max(int(DIST_WRAPPER.world_size), 1)
                 rank = int(DIST_WRAPPER.rank)
@@ -280,67 +384,103 @@ class InferenceRunner(object):
                     f"generating_missing={len(my_missing)}"
                 )
 
-                # Prepare atom_array annotations once (matches DataDumper._save_structure)
-                atom_array.set_annotation(
-                    "b_factor", np.round(np.zeros(len(atom_array)).astype(float), 2)
-                )
-                if "occupancy" not in atom_array._annot:
-                    atom_array.set_annotation(
-                        "occupancy", np.round(np.ones(len(atom_array)), 2)
-                    )
-
-                entity_poly_type = data["entity_poly_type"]
-
                 def _out_path(out_idx: int) -> str:
                     return os.path.join(
                         struct_dir, f"{sample}_sample_{int(out_idx):06d}.cif"
                     )
 
-                def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
-                    # chunk_coords: [..., chunk, N_atom, 3]
-                    # Squeeze all batch dimensions (assuming batch size 1)
-                    while chunk_coords.ndim > 3:
-                        chunk_coords = chunk_coords.squeeze(0)
-
-                    for local_i, out_idx in enumerate(indices):
-                        out_path = _out_path(int(out_idx))
-                        if os.path.exists(out_path):
-                            continue
-                        save_structure_cif(
-                            atom_array=atom_array,
-                            pred_coordinate=chunk_coords[local_i],
-                            output_fpath=out_path,
-                            entity_poly_type=entity_poly_type,
-                            pdb_id=sample,
-                        )
-
-                # Temporarily reduce N_sample to this rank's missing work.
                 orig_n_sample = int(expected_total)
-                self.configs.sample_diffusion.N_sample = int(len(my_missing))
-                try:
-                    if stream_dump:
-                        diffusion_generator.set_stream_chunk_callback(
-                            _chunk_cb,
-                            sample_indices=my_missing,
-                        )
-                        _ = self.predict(data)
+                length_groups: dict[int | None, list[int]] = {}
+                if length_by_idx is None:
+                    length_groups[None] = list(my_missing)
+                else:
+                    for out_idx in my_missing:
+                        length = int(length_by_idx[out_idx])
+                        length_groups.setdefault(length, []).append(int(out_idx))
+
+                summary = []
+                for group_len, group_indices in sorted(
+                    length_groups.items(), key=lambda x: (x[0] is None, x[0])
+                ):
+                    label = "default" if group_len is None else str(group_len)
+                    summary.append(f"{label}:{len(group_indices)}")
+                logger.info(
+                    f"[Rank {rank}] {sample}: length groups ({len(length_groups)}) "
+                    + ", ".join(summary)
+                )
+
+                for group_len, group_indices in length_groups.items():
+                    if not group_indices:
+                        continue
+                    if group_len is None:
+                        group_data = data
+                        group_atom_array = atom_array
                     else:
-                        pred = self.predict(data)
-                        coords = pred.get("coordinate", None)
-                        if coords is None:
-                            raise RuntimeError("Model prediction missing 'coordinate'.")
-                        for local_i, out_idx in enumerate(my_missing):
+                        group_data, group_atom_array, group_error = (
+                            self.dataset.build_data_for_length(
+                                sample_index, int(group_len)
+                            )
+                        )
+                        if group_error:
+                            logger.info(group_error)
+                            continue
+
+                    group_atom_array.set_annotation(
+                        "b_factor",
+                        np.round(np.zeros(len(group_atom_array)).astype(float), 2),
+                    )
+                    if "occupancy" not in group_atom_array._annot:
+                        group_atom_array.set_annotation(
+                            "occupancy", np.round(np.ones(len(group_atom_array)), 2)
+                        )
+
+                    entity_poly_type = group_data["entity_poly_type"]
+
+                    def _chunk_cb(chunk_coords: torch.Tensor, indices: list[int]) -> None:
+                        # chunk_coords: [..., chunk, N_atom, 3]
+                        # Squeeze all batch dimensions (assuming batch size 1)
+                        while chunk_coords.ndim > 3:
+                            chunk_coords = chunk_coords.squeeze(0)
+
+                        for local_i, out_idx in enumerate(indices):
+                            out_path = _out_path(int(out_idx))
+                            if os.path.exists(out_path):
+                                continue
                             save_structure_cif(
-                                atom_array=atom_array,
-                                pred_coordinate=coords[local_i],
-                                output_fpath=_out_path(int(out_idx)),
+                                atom_array=group_atom_array,
+                                pred_coordinate=chunk_coords[local_i],
+                                output_fpath=out_path,
                                 entity_poly_type=entity_poly_type,
                                 pdb_id=sample,
                             )
-                finally:
-                    if stream_dump:
-                        diffusion_generator.clear_stream_chunk_callback()
-                    self.configs.sample_diffusion.N_sample = orig_n_sample
+
+                    self.configs.sample_diffusion.N_sample = int(len(group_indices))
+                    try:
+                        if stream_dump:
+                            diffusion_generator.set_stream_chunk_callback(
+                                _chunk_cb,
+                                sample_indices=group_indices,
+                            )
+                            _ = self.predict(group_data)
+                        else:
+                            pred = self.predict(group_data)
+                            coords = pred.get("coordinate", None)
+                            if coords is None:
+                                raise RuntimeError(
+                                    "Model prediction missing 'coordinate'."
+                                )
+                            for local_i, out_idx in enumerate(group_indices):
+                                save_structure_cif(
+                                    atom_array=group_atom_array,
+                                    pred_coordinate=coords[local_i],
+                                    output_fpath=_out_path(int(out_idx)),
+                                    entity_poly_type=entity_poly_type,
+                                    pdb_id=sample,
+                                )
+                    finally:
+                        if stream_dump:
+                            diffusion_generator.clear_stream_chunk_callback()
+                        self.configs.sample_diffusion.N_sample = orig_n_sample
 
                 # Verify that this rank's owned IDs are fully present.
                 done2 = _existing_indices(struct_dir, sample)
@@ -362,6 +502,13 @@ class InferenceRunner(object):
                 )
                 if hasattr(torch.cuda, "empty_cache"):
                     torch.cuda.empty_cache()
+        if schedule_dirty and DIST_WRAPPER.rank == 0:
+            try:
+                os.makedirs(os.path.dirname(schedule_path), exist_ok=True)
+                with open(schedule_path, "w") as f:
+                    json.dump(length_schedule, f, indent=2)
+            except Exception as e:
+                logger.info(f"[Rank 0] Failed to write length schedule: {e}")
         return orig_seqs
 
     def print(self, msg: str):

@@ -651,6 +651,11 @@ def save_top_designs(
 
     merged_df = convert_strlist_col(merged_df)
     merged_df = merged_df.dropna(axis=1, how="all")
+    if "length" not in merged_df.columns and "sequence" in merged_df.columns:
+        merged_df = merged_df.copy()
+        merged_df["length"] = merged_df["sequence"].apply(
+            lambda x: len(x) if isinstance(x, str) else None
+        )
 
     # ----------------------------
     # Overall analysis (all runs)

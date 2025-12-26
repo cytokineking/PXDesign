@@ -580,6 +580,12 @@ def parse_pipeline_args(argv=None):
         default=0,
         help="CPU workers for post-eval analysis (0=auto).",
     )
+    parser.add_argument(
+        "--length-min-per-len",
+        type=int,
+        default=10,
+        help="Min designs per length when sampling binder length ranges.",
+    )
 
     overridden_keys = _get_overridden_keys(argv)
     pipeline_args, remaining = parser.parse_known_args(argv)
@@ -642,6 +648,11 @@ class DesignPipeline(InferenceRunner):
 def main(argv=None):
     configs, p = parse_args(argv)
     p["analysis_workers"] = _resolve_analysis_workers(p.get("analysis_workers"))
+    setattr(
+        configs,
+        "length_min_per_len",
+        int(p.get("length_min_per_len", 10)),
+    )
 
     os.environ.setdefault("PXDESIGN_STATUS_DIR", str(configs.dump_dir))
     os.environ["PXDESIGN_STAGE"] = "startup"
@@ -908,6 +919,11 @@ def main(argv=None):
             my_pdb_names = pending_names[DIST_WRAPPER.rank :: DIST_WRAPPER.world_size]
 
             if my_pdb_names:
+                msa_cache_dir = os.path.join(task_eval_dir, "msa_cache")
+                os.environ["PXDESIGN_MSA_CACHE_DIR"] = msa_cache_dir
+                os.environ["PXDESIGN_MSA_CACHE_FILE"] = os.path.join(
+                    msa_cache_dir, "cache.json"
+                )
                 eval_input = {
                     "task": "binder",
                     "name": task_name,

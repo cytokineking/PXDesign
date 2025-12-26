@@ -196,7 +196,7 @@ target:
       hotspots: [40, 99, 107]  # Interface residues
       msa: "./examples/msa/PDL1/0" # Path to pre-computed MSA (Recommended)
 
-binder_length: 80 # Length of the binder to design
+binder_length: 80 # Binder length (residues). Also supports a range string like "80-100".
 ```
 
 To customize the input YAML file, we highly recommend following the [Preparing Customized Inputs](#1-preparing-customized-inputs) section.
@@ -253,7 +253,8 @@ Configuration is defined in a simple `YAML` file. Below is a complete example wi
 
 ```yaml
 # ---------------- Basic Settings ----------------
-binder_length: 100       # Length of the protein binder to design (residues)
+binder_length: 100        # Binder length (residues)
+# binder_length: "80-120" # OR a range: model samples ONE length per run from [min, max]
 
 # ---------------- Target Settings ----------------
 target:

@@ -421,6 +421,12 @@ def populate_msa_with_cache(
     Same as before, but fasta_path is placed in a short human-readable subdir:
     YYYYMMDD_<random_hex>/input.fasta
     """
+    env_cache_file = os.environ.get("PXDESIGN_MSA_CACHE_FILE")
+    env_cache_dir = os.environ.get("PXDESIGN_MSA_CACHE_DIR")
+    if env_cache_file:
+        cache_file = env_cache_file
+    if env_cache_dir:
+        out_dir = env_cache_dir
 
     def _iter_entities(items: List[dict]):
         for i, item in enumerate(items):
@@ -445,20 +451,24 @@ def populate_msa_with_cache(
     os.makedirs(os.path.dirname(cache_file) or ".", exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
 
+    def _load_cache() -> Dict[str, str]:
+        cache: Dict[str, str] = {}
+        if os.path.isfile(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        cache = {
+                            _sanitize_sequence(k): v
+                            for k, v in loaded.items()
+                            if isinstance(k, str)
+                        }
+            except Exception:
+                cache = {}
+        return cache
+
     # Load cache
-    cache: Dict[str, str] = {}
-    if os.path.isfile(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    cache = {
-                        _sanitize_sequence(k): v
-                        for k, v in loaded.items()
-                        if isinstance(k, str)
-                    }
-        except Exception:
-            cache = {}
+    cache = _load_cache()
 
     # Update cache
     for i, j, entity in _iter_entities(data):
@@ -484,36 +494,59 @@ def populate_msa_with_cache(
         if sseq not in cache:
             pending.add(sseq)
 
-    # If pending, run MSA
+    # If pending, run MSA (lock to avoid redundant remote requests)
     if pending:
-        # Create short readable random subdir
-        date_str = datetime.now().strftime("%Y%m%d")
-        random_dir = os.path.join(out_dir, f"{date_str}_{_random_suffix()}")
-        os.makedirs(random_dir, exist_ok=True)
-        fasta_path = os.path.join(random_dir, "input.fasta")
+        lock_path = cache_file + ".lock"
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        with open(lock_path, "w") as lock_f:
+            try:
+                import fcntl
 
-        # Write FASTA
-        with open(fasta_path, "w") as f:
-            for idx, sseq in enumerate(sorted(pending)):
-                f.write(f">seq_{idx+1}\n")
-                f.write(sseq + "\n")
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+            except Exception:
+                pass
 
-        # Run protenix msa
-        print(f"Searching MSA with input fasta {fasta_path} and out dir {random_dir}")
-        cmd = ["protenix", "msa", "--input", fasta_path, "--out_dir", random_dir]
-        returned = run_protenix_msa(cmd)
+            # Reload cache after acquiring lock
+            cache = _load_cache()
+            pending = {sseq for _, _, sseq in wanted_pairs if sseq not in cache}
+            if pending:
+                # Create short readable random subdir
+                date_str = datetime.now().strftime("%Y%m%d")
+                random_dir = os.path.join(out_dir, f"{date_str}_{_random_suffix()}")
+                os.makedirs(random_dir, exist_ok=True)
+                fasta_path = os.path.join(random_dir, "input.fasta")
 
-        # Merge into cache
-        for seq_key, msa_path in returned.items():
-            sseq = _sanitize_sequence(seq_key)
-            if sseq in pending:
-                cache[sseq] = msa_path
+                # Write FASTA
+                with open(fasta_path, "w") as f:
+                    for idx, sseq in enumerate(sorted(pending)):
+                        f.write(f">seq_{idx+1}\n")
+                        f.write(sseq + "\n")
 
-        # Save cache
-        tmp_path = cache_file + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(cache, f, indent=2)
-        os.replace(tmp_path, cache_file)
+                # Run protenix msa
+                print(
+                    f"Searching MSA with input fasta {fasta_path} and out dir {random_dir}"
+                )
+                cmd = ["protenix", "msa", "--input", fasta_path, "--out_dir", random_dir]
+                returned = run_protenix_msa(cmd)
+
+                # Merge into cache
+                for seq_key, msa_path in returned.items():
+                    sseq = _sanitize_sequence(seq_key)
+                    if sseq in pending:
+                        cache[sseq] = msa_path
+
+                # Save cache
+                tmp_path = cache_file + ".tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(cache, f, indent=2)
+                os.replace(tmp_path, cache_file)
+
+            try:
+                import fcntl
+
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+            except Exception:
+                pass
 
     # Produce updated data
     new_data = deepcopy(data)

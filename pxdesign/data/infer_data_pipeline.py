@@ -493,3 +493,26 @@ class InferenceDataset(Dataset):
         data["sample_name"] = single_sample_dict["name"]
         data["sample_index"] = index
         return data, atom_array, error_message
+
+    def build_data_for_length(
+        self, index: int, length_override: int | None = None
+    ) -> tuple[dict[str, torch.Tensor], AtomArray, str]:
+        try:
+            single_sample_dict = deepcopy(self.inputs[index])
+            if length_override is not None:
+                for gen_seq_dict in single_sample_dict.get("generation", []):
+                    if "length" in gen_seq_dict:
+                        gen_seq_dict["length"] = int(length_override)
+            processed_sample_dict = self.process_sample_dict(single_sample_dict)
+            data, atom_array, _ = self.process_one(
+                single_sample_dict=processed_sample_dict
+            )
+            data["sequences"] = processed_sample_dict["sequences"]
+            error_message = ""
+        except Exception as e:
+            data, atom_array = {}, None
+            error_message = f"{e}:\n{traceback.format_exc()}"
+
+        data["sample_name"] = single_sample_dict["name"]
+        data["sample_index"] = index
+        return data, atom_array, error_message

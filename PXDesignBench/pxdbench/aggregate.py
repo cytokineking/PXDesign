@@ -365,7 +365,13 @@ def aggregate_binder_eval(
     binder_chain = binder_chains[0] if binder_chains else None
 
     for (name, seq_idx), sequence in sorted(sequences.items()):
-        row = {"name": name, "seq_idx": int(seq_idx), "sequence": sequence}
+        length = len(sequence) if isinstance(sequence, str) and sequence else None
+        row = {
+            "name": name,
+            "seq_idx": int(seq_idx),
+            "sequence": sequence,
+            "length": length,
+        }
 
         af2_metrics, model_ids = _collect_af2_metrics(af2_dir, name, seq_idx)
         row.update(af2_metrics)
