@@ -17,8 +17,13 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 from abc import ABC, abstractmethod
+
+try:
+    from pxdesign.utils.heartbeat import HeartbeatReporter
+except Exception:
+    HeartbeatReporter = None
 
 
 class BasePredictor(ABC):
@@ -81,6 +86,24 @@ class BasePredictor(ABC):
         if self.seed is not None:
             cmd.extend(["--seed", str(self.seed)])
 
+        hb = HeartbeatReporter.from_env() if HeartbeatReporter is not None else None
+        hb_interval_s = float(
+            os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30
+        )
+        keepalive = None
+        if hb is not None and hb_interval_s > 0:
+            stop_event = threading.Event()
+
+            def _hb_loop():
+                while not stop_event.wait(hb_interval_s):
+                    hb.touch(
+                        extra={"eval_subprocess": os.path.basename(self.script_path)}
+                    )
+
+            thread = threading.Thread(target=_hb_loop, daemon=True)
+            thread.start()
+            keepalive = (stop_event, thread)
+
         try:
             process = subprocess.Popen(
                 cmd,
@@ -117,6 +140,10 @@ class BasePredictor(ABC):
             raise
 
         finally:
+            if keepalive is not None:
+                stop_event, thread = keepalive
+                stop_event.set()
+                thread.join(timeout=1.0)
             # clean temp files
             os.unlink(input_path)
             os.unlink(output_path)

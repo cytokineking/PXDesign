@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,6 +95,137 @@ def _atomic_write_json(path: str | Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
+
+
+def _start_heartbeat_keepalive(
+    hb: Optional[HeartbeatReporter],
+    *,
+    interval_s: float = 30.0,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Optional[tuple[threading.Event, threading.Thread]]:
+    if hb is None or interval_s <= 0:
+        return None
+
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval_s):
+            try:
+                hb.touch(extra=extra)
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _update_eval_heartbeat(
+    hb: Optional[HeartbeatReporter],
+    *,
+    task_name: str,
+    task_eval_dir: str,
+    pdb_names: list[str],
+    eval_cfg,
+    seed: int,
+) -> None:
+    if hb is None:
+        return
+    rank = int(DIST_WRAPPER.rank)
+    world_size = max(int(DIST_WRAPPER.world_size), 1)
+    owned_names = pdb_names[rank::world_size]
+    if not owned_names:
+        return
+    pending_owned = _pending_pdb_names(owned_names, task_eval_dir, eval_cfg, seed)
+    owned_total = int(len(owned_names))
+    owned_done = int(owned_total - len(pending_owned))
+
+    num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
+    model_ids = _model_ids_from_cfg(eval_cfg)
+    af2_dir = os.path.join(task_eval_dir, "af2_pred")
+    ptx_dir = os.path.join(task_eval_dir, "ptx_pred")
+    ptx_mini_dir = os.path.join(task_eval_dir, "ptx_mini_pred")
+
+    eval_complex = bool(getattr(eval_cfg, "eval_complex", False))
+    eval_monomer = bool(getattr(eval_cfg, "eval_binder_monomer", False))
+    eval_ptx_mini = bool(getattr(eval_cfg, "eval_protenix_mini", False))
+    eval_ptx = bool(getattr(eval_cfg, "eval_protenix", False))
+
+    def _count_af2_done(monomer: bool) -> int:
+        if not (eval_monomer if monomer else eval_complex):
+            return owned_total
+        done = 0
+        for name in owned_names:
+            ok = True
+            for seq_idx in range(num_seqs):
+                if not _has_af2_outputs(af2_dir, name, seq_idx, model_ids, monomer=monomer):
+                    ok = False
+                    break
+            if ok:
+                done += 1
+        return int(done)
+
+    def _count_ptx_done(ptx_root: str, enabled: bool) -> int:
+        if not enabled:
+            return owned_total
+        done = 0
+        for name in owned_names:
+            ok = True
+            for seq_idx in range(num_seqs):
+                if not _has_ptx_outputs(ptx_root, name, seq_idx, seed):
+                    ok = False
+                    break
+            if ok:
+                done += 1
+        return int(done)
+
+    expected_outputs = {
+        "af2_complex": eval_complex,
+        "af2_monomer": eval_monomer,
+        "ptx_mini": eval_ptx_mini,
+        "ptx": eval_ptx,
+        "num_seqs": num_seqs,
+        "model_ids": model_ids,
+    }
+    tool_progress = {
+        "af2_complex": {
+            "enabled": eval_complex,
+            "done": _count_af2_done(monomer=False),
+            "total": owned_total,
+        },
+        "af2_monomer": {
+            "enabled": eval_monomer,
+            "done": _count_af2_done(monomer=True),
+            "total": owned_total,
+        },
+        "ptx_mini": {
+            "enabled": eval_ptx_mini,
+            "done": _count_ptx_done(ptx_mini_dir, eval_ptx_mini),
+            "total": owned_total,
+        },
+        "ptx": {
+            "enabled": eval_ptx,
+            "done": _count_ptx_done(ptx_dir, eval_ptx),
+            "total": owned_total,
+        },
+    }
+    hb.update(
+        produced_total=owned_done,
+        expected_total=owned_total,
+        primary_counter="eval_designs",
+        extra={
+            "eval": {
+                "task": task_name,
+                "owned_total": owned_total,
+                "owned_done": owned_done,
+                "owned_pending": int(len(pending_owned)),
+                "global_total": int(len(pdb_names)),
+                "expected_outputs": expected_outputs,
+                "tool_progress": tool_progress,
+            }
+        },
+        force=True,
+    )
 
 
 def _run_dir(dump_dir: str, run_id: int) -> str:
@@ -786,10 +918,8 @@ def main(argv=None):
         # --------------------
         os.environ["PXDESIGN_STAGE"] = "evaluation"
         hb = HeartbeatReporter.from_env()
-        if DIST_WRAPPER.rank == 0 and hb is not None:
-            hb.update(
-                produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+        if hb is not None:
+            hb.touch(
                 extra={"stage_transition": "evaluation", "run_id": int(run_id)},
                 force=True,
             )
@@ -848,6 +978,7 @@ def main(argv=None):
         task_eval_meta: list[dict[str, Any]] = []
 
         for task_name in sorted(active_tasks):
+            os.environ["PXDESIGN_TASK_NAME"] = str(task_name)
             struct_dir = _diffusion_struct_dir(configs.dump_dir, run_id, task_name)
             done = _existing_indices(struct_dir, task_name)
             done = {i for i in done if 0 <= i < expected_total}
@@ -910,6 +1041,15 @@ def main(argv=None):
                     )
                 continue
 
+            _update_eval_heartbeat(
+                hb,
+                task_name=task_name,
+                task_eval_dir=task_eval_dir,
+                pdb_names=pdb_names,
+                eval_cfg=configs.eval.binder,
+                seed=run_seed,
+            )
+
             pending_names = _pending_pdb_names(
                 pdb_names,
                 task_eval_dir,
@@ -935,13 +1075,40 @@ def main(argv=None):
                     "orig_seqs": last_orig_seqs.get(task_name),
                     "pred_only": True,
                 }
-                run_task(eval_input, configs.eval, device_id=DIST_WRAPPER.local_rank, seed=run_seed)
+                eval_hb_interval = float(
+                    os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30
+                )
+                keepalive = _start_heartbeat_keepalive(
+                    hb,
+                    interval_s=eval_hb_interval,
+                    extra={"eval_step": "run_task"},
+                )
+                try:
+                    run_task(
+                        eval_input,
+                        configs.eval,
+                        device_id=DIST_WRAPPER.local_rank,
+                        seed=run_seed,
+                    )
+                finally:
+                    if keepalive is not None:
+                        stop_event, thread = keepalive
+                        stop_event.set()
+                        thread.join(timeout=1.0)
+
+                _update_eval_heartbeat(
+                    hb,
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
+                )
 
                 if DIST_WRAPPER.rank == 0 and hb is not None:
-                    hb.update(
-                        produced_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
-                        expected_total=int(getattr(configs.sample_diffusion, "N_sample", 0) or 0),
+                    hb.touch(
                         extra={"eval_task": task_name, "eval_step": "run_task_complete"},
+                        primary_counter="eval_designs",
                         force=True,
                     )
 
@@ -973,6 +1140,24 @@ def main(argv=None):
                 if not pdb_names:
                     continue
 
+                _update_eval_heartbeat(
+                    hb,
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
+                )
+
+                os.environ["PXDESIGN_TASK_NAME"] = str(task_name)
+                eval_hb_interval = float(
+                    os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30
+                )
+                keepalive = _start_heartbeat_keepalive(
+                    hb,
+                    interval_s=eval_hb_interval,
+                    extra={"eval_step": "aggregate"},
+                )
                 aggregate_binder_eval(
                     task_name=task_name,
                     eval_dir=task_eval_dir,
@@ -983,6 +1168,19 @@ def main(argv=None):
                     cfg=configs.eval.binder,
                     seed=run_seed,
                     analysis_workers=int(p.get("analysis_workers")),
+                )
+                if keepalive is not None:
+                    stop_event, thread = keepalive
+                    stop_event.set()
+                    thread.join(timeout=1.0)
+
+                _update_eval_heartbeat(
+                    hb,
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
                 )
 
                 csv_path = os.path.join(task_eval_dir, "sample_level_output.csv")

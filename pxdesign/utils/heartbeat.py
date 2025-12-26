@@ -133,6 +133,7 @@ class HeartbeatReporter:
         self._produced_total: int = 0
         self._recent: List[Tuple[float, int]] = []
         self._state: str = "running"
+        self._primary_counter: str = "diffusion_samples"
 
     # ----------------------------
     # helpers
@@ -175,6 +176,7 @@ class HeartbeatReporter:
         expected_total: Optional[int] = None,
         extra: Optional[Dict[str, Any]] = None,
         state: Optional[str] = None,
+        primary_counter: Optional[str] = None,
         force: bool = False,
     ) -> None:
         now = time.time()
@@ -185,6 +187,8 @@ class HeartbeatReporter:
         if expected_total is not None:
             self._expected_total = max(int(expected_total), 0)
         self._state = state or "running"
+        if primary_counter:
+            self._primary_counter = str(primary_counter)
 
         # throughput window
         self._recent.append((now, self._produced_total))
@@ -256,7 +260,7 @@ class HeartbeatReporter:
                 "produced_total": produced,
                 "throughput_per_min": rate_per_sec * 60.0,
                 "throughput_window_sec": self.throughput_window_seconds,
-                "primary_counter": "diffusion_samples",
+                "primary_counter": self._primary_counter,
             },
         }
 
@@ -279,6 +283,24 @@ class HeartbeatReporter:
             extra=extra,
             state="completed",
             force=True,
+        )
+
+    def touch(
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        state: Optional[str] = None,
+        primary_counter: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        """Best-effort liveness update without changing progress counters."""
+        self.update(
+            produced_total=self._produced_total,
+            expected_total=self._expected_total,
+            extra=extra,
+            state=state,
+            primary_counter=primary_counter,
+            force=force,
         )
 
     # ----------------------------
@@ -356,11 +378,9 @@ class HeartbeatReporter:
             "progress": {
                 "expected_total": expected_sum,
                 "produced_total": produced_sum,
-                "primary_counter": "diffusion_samples",
+                "primary_counter": self._primary_counter,
             },
             "distributed": {
                 "per_rank": per_rank,
             },
         }
-
-

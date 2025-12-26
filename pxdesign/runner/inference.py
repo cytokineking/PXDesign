@@ -34,6 +34,7 @@ from pxdesign.model.pxdesign import ProtenixDesign
 from pxdesign.runner.dumper import DataDumper
 from pxdesign.runner.dumper import save_structure_cif
 from pxdesign.model import generator as diffusion_generator
+from pxdesign.utils.heartbeat import HeartbeatReporter
 from pxdesign.utils.infer import (
     configure_runtime_env,
     convert_to_bioassembly_dict,
@@ -232,6 +233,7 @@ class InferenceRunner(object):
         os.environ["PXDESIGN_GLOBAL_RUN"] = str(run_id)
 
         expected_total = int(getattr(self.configs.sample_diffusion, "N_sample", 0) or 0)
+        hb = HeartbeatReporter.from_env()
         min_per_len = int(
             os.environ.get(
                 "PXDESIGN_MIN_PER_LEN",
@@ -409,9 +411,13 @@ class InferenceRunner(object):
                     + ", ".join(summary)
                 )
 
+                completed_in_run = 0
                 for group_len, group_indices in length_groups.items():
                     if not group_indices:
                         continue
+                    os.environ["PXDESIGN_COMPLETED_BASE"] = str(
+                        int(owned_done + completed_in_run)
+                    )
                     if group_len is None:
                         group_data = data
                         group_atom_array = atom_array
@@ -481,6 +487,25 @@ class InferenceRunner(object):
                         if stream_dump:
                             diffusion_generator.clear_stream_chunk_callback()
                         self.configs.sample_diffusion.N_sample = orig_n_sample
+                    completed_in_run += int(len(group_indices))
+                    if hb is not None:
+                        hb.update(
+                            produced_total=int(owned_done + completed_in_run),
+                            expected_total=int(owned_total),
+                            extra={
+                                "diffusion": {
+                                    "group_length": int(group_len)
+                                    if group_len is not None
+                                    else None,
+                                    "group_samples": int(len(group_indices)),
+                                    "rank_owned_done": int(
+                                        owned_done + completed_in_run
+                                    ),
+                                    "rank_owned_total": int(owned_total),
+                                }
+                            },
+                            force=True,
+                        )
 
                 # Verify that this rank's owned IDs are fully present.
                 done2 = _existing_indices(struct_dir, sample)
@@ -496,6 +521,19 @@ class InferenceRunner(object):
                     f"[Rank {rank}] {sample} diffusion complete for owned IDs. "
                     f"owned_done={owned_done2}/{owned_total} (global_done={len(done2)}/{expected_total})"
                 )
+                if hb is not None:
+                    hb.update(
+                        produced_total=int(owned_done2),
+                        expected_total=int(owned_total),
+                        extra={
+                            "diffusion": {
+                                "task_complete": True,
+                                "rank_owned_done": int(owned_done2),
+                                "rank_owned_total": int(owned_total),
+                            }
+                        },
+                        force=True,
+                    )
             except Exception as e:
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample} {e}:\n{traceback.format_exc()}"
