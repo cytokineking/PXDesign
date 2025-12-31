@@ -77,7 +77,7 @@ model_configs = {
         "noise_scale_lambda": 1.003,
         "N_step": 400,
         "N_sample": 100,
-        "eta_schedule": {"type": "const", "min": 2.5, "max": 2.5},
+        "eta_schedule": {"type": "piecewise_65", "min": 1.0, "max": 2.5},
     },
     "model": {
         "N_model_seed": 1,  # for inference
