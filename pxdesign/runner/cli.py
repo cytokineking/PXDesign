@@ -600,22 +600,20 @@ def prepare_msa(
 
     def _maybe_convert_pdb_to_cif_and_mapping(
         cfg: dict,
-    ) -> tuple[str, dict[str, str] | None]:
+    ) -> tuple[str, dict[str, str] | None, tempfile.TemporaryDirectory | None]:
         """
         Returns:
             cif_file: path to CIF (original CIF or converted from PDB)
             chain_mapping: mapping from CIF label_asym_id -> YAML chain id (auth_asym_id),
                            only needed when input is PDB.
+            tmp_ctx: TemporaryDirectory that must be kept alive while cif_file is used.
         """
         target_file = cfg["target"]["file"]
         keep_chains = list(cfg["target"]["chains"].keys())
 
         if target_file.endswith(".pdb"):
-            fd, cif_file = tempfile.mkstemp(
-                prefix="pxdesign_pdb2cif_",
-                suffix=".cif",
-            )
-            os.close(fd)
+            tmp_ctx = tempfile.TemporaryDirectory(prefix="pxdesign_pdb2cif_")
+            cif_file = str(Path(tmp_ctx.name) / "input.cif")
             atom_array = pdb_to_cif(target_file, cif_file)
             m = build_chain_mapping(
                 atom_array.auth_asym_id,
@@ -623,9 +621,9 @@ def prepare_msa(
                 keep_chains=keep_chains,
             )
             chain_mapping = {v: k for k, v in m.items()}
-            return cif_file, chain_mapping
+            return cif_file, chain_mapping, tmp_ctx
 
-        return target_file, None
+        return target_file, None, None
 
     def _filter_input_json_by_chains(
         input_json: dict,
@@ -714,84 +712,85 @@ def prepare_msa(
     # -----------------------------
     cfg = _load_yaml(yaml_file)
 
-    cif_file, chain_mapping = _maybe_convert_pdb_to_cif_and_mapping(cfg)
-    avail_chains = set(cfg["target"]["chains"].keys())
+    cif_file, chain_mapping, tmp_ctx = _maybe_convert_pdb_to_cif_and_mapping(cfg)
+    try:
+        avail_chains = set(cfg["target"]["chains"].keys())
 
-    input_json = cif_to_input_json(cif_file, save_entity_and_asym_id=True)
-    input_json = _filter_input_json_by_chains(
-        input_json,
-        avail_chains=avail_chains,
-        chain_mapping=chain_mapping,
-    )
-
-    if cfg["target"]["file"].endswith(".pdb"):
-        try:
-            os.remove(cif_file)
-        except OSError:
-            pass
-
-    msa_dirs: dict[str, str] = {}
-
-    if msa_mode.lower() == "protenix":
-        from pxdbench.tools.ptx.ptx_utils import populate_msa_with_cache
-
-        # populate precomputed MSA using cache
-        input_json = populate_msa_with_cache([input_json])[0]
-        msa_dirs = _extract_msa_dirs(input_json)
-
-        # sanity: ensure every requested chain has an MSA dir available
-        missing = [c for c in avail_chains if c not in msa_dirs]
-        if missing:
-            raise click.ClickException(
-                f"Missing MSA for chain(s): {missing}. Check Protenix search cache or chain IDs."
-            )
-
-    elif msa_mode.lower() in {"colabfold", "mmseqs"}:
-        from pxdesign.utils.msa import (
-            ColabFoldMSAConfig,
-            ensure_pxdesign_msa_dir_from_colabfold,
+        input_json = cif_to_input_json(cif_file, save_entity_and_asym_id=True)
+        input_json = _filter_input_json_by_chains(
+            input_json,
+            avail_chains=avail_chains,
+            chain_mapping=chain_mapping,
         )
 
-        chain_to_seq = _extract_chain_sequences(input_json)
+        msa_dirs: dict[str, str] = {}
 
-        # Determine which chains need MSA injection (skip ones already set)
-        needed: list[str] = []
-        for chain_id, chain_cfg in cfg["target"]["chains"].items():
-            if not isinstance(chain_cfg, dict):
-                continue
-            if "msa" in chain_cfg and chain_cfg["msa"]:
-                continue
-            needed.append(str(chain_id))
+        if msa_mode.lower() == "protenix":
+            from pxdbench.tools.ptx.ptx_utils import populate_msa_with_cache
 
-        missing_seqs = [c for c in needed if c not in chain_to_seq]
-        if missing_seqs:
-            raise click.ClickException(
-                f"Could not extract sequence(s) for chain(s): {missing_seqs}. "
-                "Ensure `target.file` contains sequences for these chains."
+            # populate precomputed MSA using cache
+            input_json = populate_msa_with_cache([input_json])[0]
+            msa_dirs = _extract_msa_dirs(input_json)
+
+            # sanity: ensure every requested chain has an MSA dir available
+            missing = [c for c in avail_chains if c not in msa_dirs]
+            if missing:
+                raise click.ClickException(
+                    f"Missing MSA for chain(s): {missing}. Check Protenix search cache or chain IDs."
+                )
+
+        elif msa_mode.lower() in {"colabfold", "mmseqs"}:
+            from pxdesign.utils.msa import (
+                ColabFoldMSAConfig,
+                ensure_pxdesign_msa_dir_from_colabfold,
             )
 
-        root = (
-            Path(msa_dir)
-            if msa_dir
-            else Path(yaml_file).resolve().parent
-            / "msas_colabfold"
-            / Path(yaml_file).stem
-        )
-        cfg_cf = ColabFoldMSAConfig(host_url=colabfold_url)
+            chain_to_seq = _extract_chain_sequences(input_json)
 
-        for chain_id in needed:
-            seq = chain_to_seq[chain_id]
-            chain_out = root / f"chain_{chain_id}"
-            ensure_pxdesign_msa_dir_from_colabfold(
-                sequence=seq,
-                out_dir=chain_out,
-                cfg=cfg_cf,
-                force=force,
+            # Determine which chains need MSA injection (skip ones already set)
+            needed: list[str] = []
+            for chain_id, chain_cfg in cfg["target"]["chains"].items():
+                if not isinstance(chain_cfg, dict):
+                    continue
+                if "msa" in chain_cfg and chain_cfg["msa"]:
+                    continue
+                needed.append(str(chain_id))
+
+            missing_seqs = [c for c in needed if c not in chain_to_seq]
+            if missing_seqs:
+                raise click.ClickException(
+                    f"Could not extract sequence(s) for chain(s): {missing_seqs}. "
+                    "Ensure `target.file` contains sequences for these chains."
+                )
+
+            root = (
+                Path(msa_dir)
+                if msa_dir
+                else Path(yaml_file).resolve().parent
+                / "msas_colabfold"
+                / Path(yaml_file).stem
             )
-            msa_dirs[chain_id] = str(chain_out)
+            cfg_cf = ColabFoldMSAConfig(host_url=colabfold_url)
 
-    else:
-        raise click.ClickException(f"Invalid --msa-mode: {msa_mode}")
+            for chain_id in needed:
+                seq = chain_to_seq[chain_id]
+                chain_out = root / f"chain_{chain_id}"
+                ensure_pxdesign_msa_dir_from_colabfold(
+                    sequence=seq,
+                    out_dir=chain_out,
+                    cfg=cfg_cf,
+                    force=force,
+                )
+                msa_dirs[chain_id] = str(chain_out)
+
+        else:
+            raise click.ClickException(f"Invalid --msa-mode: {msa_mode}")
+    finally:
+        if tmp_ctx is not None:
+            try:
+                tmp_ctx.cleanup()
+            except Exception:
+                pass
 
     chains = cfg["target"]["chains"]
     updated = False
