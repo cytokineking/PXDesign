@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import sys
 import shutil
 import subprocess
 import time
@@ -524,7 +525,7 @@ def save_difficulty_fig(df, mode, save_dir, use_template=False):
         ptx_sr = df[col_ptx_basic].mean() * 100
         length = len(df["sequence"][0])
         cmd = [
-            "python3",
+            sys.executable,
             f"{project_root}/pxd_server/server_extended_mode.py",
             "--out_af2_sr",
             f"{af2_sr}",
@@ -543,7 +544,7 @@ def save_difficulty_fig(df, mode, save_dir, use_template=False):
         af2_sr = df["af2_easy_success"].mean() * 100
         length = len(df["sequence"][0])
         cmd = [
-            "python3",
+            sys.executable,
             f"{project_root}/pxd_server/server_preview_mode.py",
             "--out_af2_ipae",
             f"{af2_ipae}",

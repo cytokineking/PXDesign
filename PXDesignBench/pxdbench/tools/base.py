@@ -14,10 +14,11 @@
 
 import json
 import os
-import subprocess
 import sys
+import subprocess
 import tempfile
 import threading
+import importlib.util
 from abc import ABC, abstractmethod
 
 try:
@@ -71,11 +72,28 @@ class BasePredictor(ABC):
             json.dump(input_data, f)
             input_path = f.name
 
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(self.script_path), "..", "..")
+        )
+        existing_pythonpath = self.env.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            self.env["PYTHONPATH"] = os.pathsep.join([repo_root, existing_pythonpath])
+        else:
+            self.env["PYTHONPATH"] = repo_root
+
+        if importlib.util.find_spec("colabdesign") is None:
+            raise RuntimeError(
+                "colabdesign is not available in the active interpreter. "
+                f"Command is being run with {sys.executable}. "
+                "Ensure the pxdesign conda/micromamba environment installs colabdesign "
+                "before running jobs."
+            )
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             output_path = f.name
 
         cmd = [
-            "python3",
+            sys.executable,
             "-u",
             self.script_path,
             "--input",

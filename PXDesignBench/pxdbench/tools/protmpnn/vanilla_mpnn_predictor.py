@@ -14,6 +14,7 @@
 
 import json
 import os
+import sys
 import subprocess
 import tempfile
 from typing import Any, Dict, List
@@ -56,7 +57,7 @@ class VanillaMPNNPredictor:
 
         output_path = os.path.join(input_dir, "parsed_pdbs.jsonl")
         cmd = [
-            "python3",
+            sys.executable,
             "-u",
             self.prepare_script_path,
             "--input_path",
@@ -125,7 +126,7 @@ class VanillaMPNNPredictor:
 
         output_dir = os.path.dirname(jsonl_path)
         cmd = [
-            "python3",
+            sys.executable,
             "-u",
             self.run_script_path,
             "--jsonl_path",

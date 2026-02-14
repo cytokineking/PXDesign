@@ -24,6 +24,10 @@ env_name="pxdesign"
 pkg_manager="conda"      # conda | mamba | micromamba
 cuda_version=""          # e.g. 12.1, 12.2, 12.4
 
+# Ensure script runs from its own directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
 # ----------------------------------------------------------
 # Parse command-line options
 # ----------------------------------------------------------
@@ -104,14 +108,21 @@ fi
 # Extend this mapping as needed.
 torch_tag=""
 torch_version="2.3.1"   # adjust if needed
+cuda_major="${cuda_version%%.*}"
+cuda_minor="${cuda_version#*.}"
+if [[ "${cuda_version}" == "${cuda_minor}" ]]; then
+  cuda_minor="0"
+else
+  cuda_minor="${cuda_minor%%.*}"
+fi
 
-if [[ "${cuda_version}" == 12.1* || "${cuda_version}" == 12.2* ]]; then
-  torch_tag="cu121"
-elif [[ "${cuda_version}" == 12.4* || "${cuda_version}" == 12.5* ]]; then
+if (( cuda_major == 12 && cuda_minor >= 4 )) || (( cuda_major > 12 )); then
   torch_tag="cu124"
+elif [[ "${cuda_version}" == 12.1* || "${cuda_version}" == 12.2* ]]; then
+  torch_tag="cu121"
 else
   echo "Error: unsupported CUDA version '${cuda_version}' for this installer."
-  echo "       Currently supported: 12.1, 12.2 (cu121) and 12.4+ (cu124)."
+  echo "       Currently supported: 12.1, 12.2 (cu121) and >=12.4 (cu124)."
   exit 1
 fi
 
@@ -210,24 +221,36 @@ else
 fi
 
 echo "Environment '${env_name}' successfully activated."
+PYTHON_BIN="$(command -v python3 || command -v python)"
+if [ -z "${PYTHON_BIN}" ]; then
+  echo "Error: python executable not found after environment activation."
+  exit 1
+fi
+echo "Python interpreter: ${PYTHON_BIN}"
+
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  echo "VIRTUAL_ENV: ${VIRTUAL_ENV}"
+fi
+echo "Conda env (if any): ${CONDA_DEFAULT_ENV:-<not-set>}"
+echo "PYTHONPATH: ${PYTHONPATH:-<not-set>}"
 
 ############################################################
 # Python package installation
 ############################################################
 
 echo ">>> Upgrading pip"
-python -m pip install --upgrade pip
+"${PYTHON_BIN}" -m pip install --upgrade pip
 
 # ----------------------------------------------------------
 # 1) Install GPU PyTorch first (matching CUDA version)
 # ----------------------------------------------------------
 echo ">>> Installing PyTorch (GPU, CUDA ${cuda_version}, tag ${torch_tag})"
-pip install --no-cache-dir \
+"${PYTHON_BIN}" -m pip install --no-cache-dir \
   "torch==${torch_version}" \
   --index-url "https://download.pytorch.org/whl/${torch_tag}" \
   || { echo "Error: failed to install PyTorch ${torch_version} with ${torch_tag} wheels."; exit 1; }
 
-python - << 'PYTORCH_CHECK'
+"${PYTHON_BIN}" - << 'PYTORCH_CHECK'
 import torch
 print("PyTorch version:", torch.__version__)
 print("CUDA available :", torch.cuda.is_available())
@@ -241,11 +264,11 @@ PYTORCH_CHECK
 # ----------------------------------------------------------
 
 echo ">>> Installing Protenix"
-pip install --no-cache-dir "git+https://github.com/bytedance/Protenix.git@v0.5.0+pxd" \
+"${PYTHON_BIN}" -m pip install --no-cache-dir "git+https://github.com/bytedance/Protenix.git@v0.5.0+pxd" \
   || { echo "Error: failed to install Protenix."; exit 1; }
 
 echo ">>> Installing PXDesignBench base dependencies"
-pip install --no-cache-dir \
+"${PYTHON_BIN}" -m pip install --no-cache-dir \
   einops \
   natsort \
   dm-tree \
@@ -256,26 +279,26 @@ pip install --no-cache-dir \
   || { echo "Error: failed to install base Python dependencies."; exit 1; }
 
 echo ">>> Installing ColabDesign (without dependencies)"
-pip install --no-cache-dir git+https://github.com/sokrypton/ColabDesign.git --no-deps \
+"${PYTHON_BIN}" -m pip install --no-cache-dir git+https://github.com/sokrypton/ColabDesign.git --no-deps \
   || { echo "Error: failed to install ColabDesign."; exit 1; }
 
 echo ">>> Installing JAX with CUDA support"
-pip install --no-cache-dir \
+"${PYTHON_BIN}" -m pip install --no-cache-dir \
   "jax[cuda]==0.4.29" \
   -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html \
   || { echo "Error: failed to install JAX (CUDA build)."; exit 1; }
 
 # downgrade numpy
-pip install --no-cache-dir \
+"${PYTHON_BIN}" -m pip install --no-cache-dir \
   "numpy==1.26.3" \
   || { echo "Error: failed to install numpy 1.26.3."; exit 1; }
 
 echo ">>> Installing PXDesignBench (bundled)"
-pip install -e ./PXDesignBench \
+"${PYTHON_BIN}" -m pip install -e ./PXDesignBench \
   || { echo "Error: failed to install PXDesignBench."; exit 1; }
 
 echo ">>> Installing PXDesign"
-pip install -e .
+"${PYTHON_BIN}" -m pip install -e .
 
 if [ "${env_tool}" = "micromamba" ]; then
   micromamba install -c conda-forge cudnn -y || { echo "Error: failed to install cudnn with micromamba."; exit 1; }
@@ -307,8 +330,13 @@ fi
 
 echo ">>> Running sanity checks (import tests)"
 
-python - << 'PYCODE'
+export PYINSTALL_DIR="${SCRIPT_DIR}"
+"${PYTHON_BIN}" - << 'PYCODE'
 import sys
+import os
+import shutil
+from pathlib import Path
+print(f"PYTHON_EXECUTABLE={sys.executable}")
 
 def check(mod):
     try:
@@ -333,6 +361,15 @@ for m in modules:
 
 import jax
 print("JAX devices:", jax.devices())
+
+pxd_dir = Path(os.environ.get("PYINSTALL_DIR", "/root/PXDesign"))
+assert pxd_dir.exists(), f"Expected PXDesign repo at {pxd_dir} missing"
+print(f"[OK] PXDesign checkout found at {pxd_dir}")
+
+pxdesign_bin = shutil.which("pxdesign")
+if not pxdesign_bin:
+    raise RuntimeError("pxdesign CLI is not available on PATH in the active interpreter")
+print(f"[OK] pxdesign entry point: {pxdesign_bin}")
 PYCODE
 
 echo "Sanity checks completed."
