@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 from colabdesign import clear_mem, mk_afdesign_model
 from colabdesign.shared.utils import copy_dict
@@ -27,6 +28,28 @@ from pxdbench.tools.af2.af2_utils import add_cyclic_offset
 from pxdbench.utils import concat_dict_values, seed_everything
 
 logger = logging.getLogger(__name__)
+
+
+def _read_existing_stats(path: str, required_keys: set[str]) -> dict[str, Any] | None:
+    if not os.path.exists(path) or not os.path.getsize(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not required_keys.issubset(set(data.keys())):
+        return None
+    return data
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
 
 
 def predict_binder_monomer(
@@ -57,27 +80,32 @@ def predict_binder_monomer(
         output_name = f"{design_name}_model{model_num + 1}"
         output_pdb = os.path.join(save_dir, f"{output_name}.pdb")
         output_stats_json = os.path.join(save_dir, f"{output_name}.json")
-
-        if os.path.exists(output_pdb) and os.path.exists(output_stats_json):
+        required_keys = {"pLDDT_MONOMER", "pTM_MONOMER", "pAE_MONOMER"}
+        stats = _read_existing_stats(output_stats_json, required_keys)
+        if (
+            stats is not None
+            and os.path.exists(output_pdb)
+            and os.path.getsize(output_pdb) > 0
+        ):
             print(
-                f"Found existing {output_pdb} and {output_stats_json}. Will load from them."
+                f"Found complete existing {output_pdb} and {output_stats_json}. Will load from them."
             )
-            # load stats
-            with open(output_stats_json, "r") as f:
-                stats = json.load(f)
             print(f"Loaded {output_stats_json}.")
-        else:
-            prediction_model.predict(models=[model_num], num_recycles=3, verbose=True)
-            metrics = copy_dict(prediction_model.aux["log"])
-            stats = {
-                "pLDDT_MONOMER": round(metrics["plddt"], 3),
-                "pTM_MONOMER": round(metrics["ptm"], 3),
-                "pAE_MONOMER": round(metrics["pae"], 3),
-            }
-            # save pdb and stats
-            prediction_model.save_pdb(output_pdb)
-            with open(output_stats_json, "w") as f:
-                json.dump(stats, f)
+            prediction_stats[model_num] = stats
+            continue
+
+        prediction_model.predict(models=[model_num], num_recycles=3, verbose=True)
+        metrics = copy_dict(prediction_model.aux["log"])
+        stats = {
+            "pLDDT_MONOMER": round(metrics["plddt"], 3),
+            "pTM_MONOMER": round(metrics["ptm"], 3),
+            "pAE_MONOMER": round(metrics["pae"], 3),
+        }
+        # save pdb and stats atomically
+        tmp_pdb = output_pdb + ".tmp"
+        prediction_model.save_pdb(tmp_pdb)
+        os.replace(tmp_pdb, output_pdb)
+        _atomic_write_json(output_stats_json, stats)
         prediction_stats[model_num] = stats
 
     return prediction_stats
@@ -220,8 +248,10 @@ def main():
             is_cyclic=input_data["is_cyclic"],
         )
 
-        with open(args.output, "w") as f:
+        output_tmp = args.output + ".tmp"
+        with open(output_tmp, "w") as f:
             json.dump(results, f)
+        os.replace(output_tmp, args.output)
 
         print(f"Successfully completed AF2 binder only prediction!")
 

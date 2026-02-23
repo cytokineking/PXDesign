@@ -147,8 +147,15 @@ class BasePredictor(ABC):
                     print(error.strip())
 
             returncode = process.wait()
+            if returncode != 0:
+                raise RuntimeError(
+                    f"AF2 predictor script exited with return code {int(returncode)}"
+                )
             if self.verbose:
                 print(f"Run subprocess success: {returncode}")
+
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("AF2 predictor output file missing or empty")
 
             with open(output_path, "r") as f:
                 return json.load(f)
@@ -163,5 +170,9 @@ class BasePredictor(ABC):
                 stop_event.set()
                 thread.join(timeout=1.0)
             # clean temp files
-            os.unlink(input_path)
-            os.unlink(output_path)
+            for tmp_path in (input_path, output_path):
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
