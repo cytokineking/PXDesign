@@ -637,6 +637,19 @@ def _normalize_chain_ids(value: Any) -> list[str]:
     return []
 
 
+def _chain_ids_for_hint_compare(value: Any) -> list[str]:
+    ids = _normalize_chain_ids(value)
+    canonical: set[str] = set()
+    for chain in ids:
+        chain_s = str(chain).strip()
+        if not chain_s:
+            continue
+        if chain_s.endswith("0") and chain_s[:-1].isalpha():
+            chain_s = chain_s[:-1]
+        canonical.add(chain_s)
+    return sorted(canonical)
+
+
 def _extract_chain_hints_from_input(task_input: dict | None) -> tuple[list[str], list[str]]:
     if not isinstance(task_input, dict):
         return [], []
@@ -711,22 +724,62 @@ def _resolve_authoritative_chain_payload_rank0(
             f"within timeout_s={int(timeout_s)}"
         )
 
+    def _cond_hint_variants(base_hint: list[str]) -> list[list[str]]:
+        normalized = _normalize_chain_ids(base_hint)
+        variants: list[list[str]] = [normalized]
+        with_suffix = []
+        for chain in normalized:
+            chain_s = str(chain).strip()
+            if chain_s and not any(ch.isdigit() for ch in chain_s):
+                with_suffix.append(f"{chain_s}0")
+            else:
+                with_suffix.append(chain_s)
+        with_suffix = _normalize_chain_ids(with_suffix)
+        if with_suffix != normalized:
+            variants.append(with_suffix)
+        without_suffix = []
+        for chain in normalized:
+            chain_s = str(chain).strip()
+            if chain_s.endswith("0") and chain_s[:-1].isalpha():
+                without_suffix.append(chain_s[:-1])
+            else:
+                without_suffix.append(chain_s)
+        without_suffix = _normalize_chain_ids(without_suffix)
+        if without_suffix and without_suffix not in variants:
+            variants.append(without_suffix)
+        return variants
+
+    selected_cond_hint = list(cond_hint)
+    last_assertion_error: AssertionError | None = None
     try:
-        _, _, inferred_cond, inferred_binder = convert_cifs_to_pdbs(
-            probe_cif_dir,
-            out_pdb_dir=probe_pdb_dir,
-            condition_chains=cond_hint or None,
-        )
+        hint_variants = _cond_hint_variants(cond_hint) if cond_hint else [[]]
+        for hint_variant in hint_variants:
+            try:
+                _, _, inferred_cond, inferred_binder = convert_cifs_to_pdbs(
+                    probe_cif_dir,
+                    out_pdb_dir=probe_pdb_dir,
+                    condition_chains=hint_variant or None,
+                )
+                selected_cond_hint = list(hint_variant)
+                last_assertion_error = None
+                break
+            except AssertionError as e:
+                last_assertion_error = e
+                continue
+        if last_assertion_error is not None:
+            raise last_assertion_error
     finally:
         if os.path.isdir(probe_root):
             shutil.rmtree(probe_root)
 
+    cond_hint = _normalize_chain_ids(selected_cond_hint)
+
     inferred_cond = _normalize_chain_ids(inferred_cond)
     inferred_binder = _normalize_chain_ids(inferred_binder)
 
-    if cond_hint and inferred_cond and _canonical_hash(cond_hint) != _canonical_hash(
-        inferred_cond
-    ):
+    if cond_hint and inferred_cond and _canonical_hash(
+        _chain_ids_for_hint_compare(cond_hint)
+    ) != _canonical_hash(_chain_ids_for_hint_compare(inferred_cond)):
         raise RuntimeError(
             f"Condition chain mismatch for {task_name}: input={cond_hint} inferred={inferred_cond}"
         )
@@ -953,10 +1006,14 @@ def _validate_chain_payload(
     if expected_chain_payload is None:
         return True
     return (
-        _canonical_hash(payload.get("cond_chains", []))
-        == _canonical_hash(expected_chain_payload.get("cond_chains", []))
-        and _canonical_hash(payload.get("binder_chains", []))
-        == _canonical_hash(expected_chain_payload.get("binder_chains", []))
+        _canonical_hash(_chain_ids_for_hint_compare(payload.get("cond_chains", [])))
+        == _canonical_hash(
+            _chain_ids_for_hint_compare(expected_chain_payload.get("cond_chains", []))
+        )
+        and _canonical_hash(_chain_ids_for_hint_compare(payload.get("binder_chains", [])))
+        == _canonical_hash(
+            _chain_ids_for_hint_compare(expected_chain_payload.get("binder_chains", []))
+        )
     )
 
 
@@ -2180,6 +2237,8 @@ def main(argv=None):
             my_pdb_names = list(my_owned_names)
 
             if my_pdb_names:
+                eval_cond_chains = _chain_ids_for_hint_compare(cond_chains)
+                eval_binder_chains = _chain_ids_for_hint_compare(binder_chains)
                 msa_cache_dir = os.path.join(task_eval_dir, "msa_cache")
                 os.environ["PXDESIGN_MSA_CACHE_DIR"] = msa_cache_dir
                 os.environ["PXDESIGN_MSA_CACHE_FILE"] = os.path.join(
@@ -2190,8 +2249,8 @@ def main(argv=None):
                     "name": task_name,
                     "pdb_dir": pdb_dir,
                     "pdb_names": my_pdb_names,
-                    "cond_chains": cond_chains,
-                    "binder_chains": binder_chains,
+                    "cond_chains": eval_cond_chains,
+                    "binder_chains": eval_binder_chains,
                     "out_dir": task_eval_dir,
                     "orig_seqs": last_orig_seqs.get(task_name),
                     "pred_only": True,

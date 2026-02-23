@@ -28,13 +28,23 @@ from pxdbench.metrics.Kalign import kabsch_algorithm
 # ------------------------- basic utils -------------------------
 
 
+def _strip_tmp_suffix(path: str) -> str:
+    """Ignore trailing .tmp extensions when checking file type."""
+    current = path
+    while True:
+        root, ext = os.path.splitext(current)
+        if ext.lower() != ".tmp":
+            return current
+        current = root
+
+
 def is_cif(path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
+    ext = os.path.splitext(_strip_tmp_suffix(path))[1].lower()
     return ext in {".cif", ".mmcif"}
 
 
 def is_pdb(path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
+    ext = os.path.splitext(_strip_tmp_suffix(path))[1].lower()
     return ext in {".pdb", ".ent"}
 
 
