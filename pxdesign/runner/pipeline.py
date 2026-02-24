@@ -41,8 +41,10 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -383,6 +385,172 @@ def _existing_indices(struct_dir: str, task_name: str) -> set[int]:
     return out
 
 
+def _pick_canonical_decision_task(
+    *,
+    active_tasks: set[str] | None,
+    last_orig_seqs: dict[str, Any] | None,
+    fallback_tasks: list[str],
+) -> Optional[str]:
+    """Pick a deterministic task used for target-template decision."""
+    if active_tasks:
+        candidates = sorted({str(t) for t in active_tasks if str(t).strip()})
+        if candidates:
+            return str(candidates[0])
+    if isinstance(last_orig_seqs, dict) and last_orig_seqs:
+        candidates = sorted({str(t) for t in last_orig_seqs.keys() if str(t).strip()})
+        if candidates:
+            return str(candidates[0])
+    if fallback_tasks:
+        candidates = sorted({str(t) for t in fallback_tasks if str(t).strip()})
+        if candidates:
+            return str(candidates[0])
+    return None
+
+
+def _is_readable_json_file(path: str) -> bool:
+    try:
+        with open(path, "r") as f:
+            json.load(f)
+        return True
+    except Exception:
+        return False
+
+
+def _inspect_target_pred_artifacts(
+    *,
+    target_pred_dir: str,
+    task_name: str,
+    run_seed: int,
+) -> dict[str, Any]:
+    """
+    Inspect target_pred artifacts for sample_0.
+
+    Returns:
+      {
+        "complete": bool,
+        "reason": str,
+        "seed_dir": str,
+        "pred_dir": str,
+        "pred_cif_path": str | None,
+        "summary_json_path": str | None,
+        "has_success_file": bool,
+      }
+    """
+    seed_dir = os.path.join(target_pred_dir, str(task_name), f"seed_{int(run_seed)}")
+    pred_dir = os.path.join(seed_dir, "predictions")
+    info: dict[str, Any] = {
+        "complete": False,
+        "reason": "",
+        "seed_dir": seed_dir,
+        "pred_dir": pred_dir,
+        "pred_cif_path": None,
+        "summary_json_path": None,
+        "has_success_file": bool(os.path.isfile(os.path.join(seed_dir, "SUCCESS_FILE"))),
+    }
+    if not os.path.isdir(pred_dir):
+        info["reason"] = f"missing predictions dir: {pred_dir}"
+        return info
+
+    cif_candidates = sorted(Path(pred_dir).glob("*_sample_0.cif"))
+    nonempty_cifs = [str(fp) for fp in cif_candidates if _is_nonempty_file(str(fp))]
+    if not nonempty_cifs:
+        info["reason"] = "missing non-empty sample_0 cif"
+        return info
+
+    pred_cif_path = str(nonempty_cifs[0])
+    info["pred_cif_path"] = pred_cif_path
+
+    pred_prefix = Path(pred_cif_path).name.removesuffix("_sample_0.cif")
+    expected_summary = os.path.join(
+        pred_dir,
+        f"{pred_prefix}_summary_confidence_sample_0.json",
+    )
+    if not _is_readable_json_file(expected_summary):
+        info["reason"] = (
+            "missing readable summary_confidence_sample_0 json for matched cif prefix"
+        )
+        return info
+
+    info["summary_json_path"] = expected_summary
+    info["complete"] = True
+    return info
+
+
+def _state_allows_target_template_reuse(
+    *,
+    state_obj: Optional[dict],
+    run_id: int,
+    run_seed: int,
+    decision_task: str,
+    rmsd_threshold: float,
+) -> bool:
+    if not isinstance(state_obj, dict):
+        return False
+    try:
+        if int(state_obj.get("run_id", -1)) != int(run_id):
+            return False
+        if int(state_obj.get("run_seed", -1)) != int(run_seed):
+            return False
+        if str(state_obj.get("decision_task", "")) != str(decision_task):
+            return False
+        if "use_target_template" not in state_obj:
+            return False
+        state_threshold = float(state_obj.get("target_template_rmsd_thres"))
+        if not math.isfinite(state_threshold):
+            return False
+        if abs(float(state_threshold) - float(rmsd_threshold)) > 1e-9:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _derive_target_template_from_existing_artifacts(
+    *,
+    gt_cif_path: str,
+    pred_cif_path: str,
+    rmsd_threshold: float,
+) -> tuple[Optional[bool], Optional[float], str]:
+    """
+    Derive use_target_template from existing target_pred artifacts.
+
+    This helper is read-only with respect to target_pred paths:
+    temporary outputs are written under a temp directory.
+    """
+    if not _is_nonempty_file(gt_cif_path):
+        return None, None, f"missing/non-empty gt cif: {gt_cif_path}"
+    if not _is_nonempty_file(pred_cif_path):
+        return None, None, f"missing/non-empty pred cif: {pred_cif_path}"
+
+    try:
+        from pxdbench.metrics.Kalign import align_and_calculate_target_rmsd
+        from pxdbench.permutation import permute_generated_min_complex_rmsd
+        from pxdbench.utils import convert_cif_to_pdb
+        from pxdesign.runner.helpers import keep_target_chains
+    except Exception as e:
+        return None, None, f"import error: {e}"
+
+    tmp_parent = os.path.join(tempfile.gettempdir(), "pxdesign_target_template_rmsd")
+    os.makedirs(tmp_parent, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="rmsd_", dir=tmp_parent) as tmp_dir:
+            gt_pdb_path = os.path.join(tmp_dir, "gt_target.pdb")
+            pred_pdb_path = os.path.join(tmp_dir, "pred_target.pdb")
+
+            convert_cif_to_pdb(gt_cif_path, gt_pdb_path)
+            keep_target_chains(gt_pdb_path, gt_pdb_path)
+            convert_cif_to_pdb(pred_cif_path, pred_pdb_path)
+            permute_generated_min_complex_rmsd(pred_pdb_path, gt_pdb_path, pred_pdb_path)
+            rmsd = float(align_and_calculate_target_rmsd(pred_pdb_path, gt_pdb_path))
+            if not math.isfinite(rmsd):
+                return None, None, f"non-finite rmsd: {rmsd}"
+    except Exception as e:
+        return None, None, f"rmsd derivation error: {e}"
+
+    use_target_template = bool(float(rmsd) >= float(rmsd_threshold))
+    return use_target_template, float(rmsd), ""
+
+
 def _get_completed_ptx_samples(ptx_pred_dir: str, seed: int) -> set[str]:
     """
     Return set of sample names that have completed Protenix predictions.
@@ -599,6 +767,35 @@ def _pending_pdb_names(
         if not complete:
             pending.append(name)
     return pending
+
+
+def _has_any_pending_eval_work(
+    *,
+    dump_dir: str,
+    run_id: int,
+    active_tasks: set[str],
+    expected_total: int,
+    eval_cfg,
+    run_seed: int,
+) -> bool:
+    """Return True when at least one active task still has pending eval outputs."""
+    for task_name in sorted(active_tasks):
+        struct_dir = _diffusion_struct_dir(dump_dir, run_id, task_name)
+        done = _existing_indices(struct_dir, task_name)
+        done = {i for i in done if 0 <= i < int(expected_total)}
+        pdb_names = [f"{task_name}_sample_{int(i):06d}" for i in sorted(done)]
+        if not pdb_names:
+            continue
+        task_eval_dir = _eval_task_dir(dump_dir, run_id, task_name)
+        pending_names = _pending_pdb_names(
+            pdb_names,
+            task_eval_dir,
+            eval_cfg,
+            run_seed,
+        )
+        if pending_names:
+            return True
+    return False
 
 
 def _attempt_dir_name(attempt_token: str) -> str:
@@ -2002,27 +2199,156 @@ def main(argv=None):
             )
             if DIST_WRAPPER.rank == 0:
                 use_target_template = False
-                if last_orig_seqs:
-                    first_task = list(last_orig_seqs.keys())[0]
+                decision_source = "emergency_fallback"
+                decision_task = ""
+                try:
+                    target_template_rmsd_thres = float(
+                        p.get("target_template_rmsd_thres", 2.0)
+                    )
+                except Exception:
+                    target_template_rmsd_thres = 2.0
+                target_template_rmsd: Optional[float] = None
+
+                expected_total_for_eval = int(
+                    getattr(configs.sample_diffusion, "N_sample", 0) or 0
+                )
+                has_pending_eval = _has_any_pending_eval_work(
+                    dump_dir=configs.dump_dir,
+                    run_id=run_id,
+                    active_tasks=set(active_tasks),
+                    expected_total=expected_total_for_eval,
+                    eval_cfg=configs.eval.binder,
+                    run_seed=run_seed,
+                )
+
+                if not has_pending_eval:
+                    decision_source = "no_pending_eval"
+                    logger.info(
+                        "[pipeline] no pending eval names; skipping target-template decision for run=%d seed=%d",
+                        int(run_id),
+                        int(run_seed),
+                    )
+                else:
+                    decision_task = _pick_canonical_decision_task(
+                        active_tasks=active_tasks,
+                        last_orig_seqs=last_orig_seqs,
+                        fallback_tasks=task_names,
+                    )
+
+                if has_pending_eval and decision_task:
                     gt_cif_path = os.path.join(
-                        _diffusion_struct_dir(configs.dump_dir, run_id, first_task),
-                        f"{first_task}_sample_{0:06d}.cif",
+                        _diffusion_struct_dir(configs.dump_dir, run_id, decision_task),
+                        f"{decision_task}_sample_{0:06d}.cif",
                     )
                     target_pred_dir = os.path.join(
-                        _eval_task_dir(configs.dump_dir, run_id, first_task),
+                        _eval_task_dir(configs.dump_dir, run_id, decision_task),
                         "target_pred",
                     )
-                    use_target_template = bool(
-                        use_target_template_or_not(
-                            configs.eval,
-                            p,
-                            gt_cif_path,
-                            last_orig_seqs.get(first_task),
-                            first_task,
-                            target_pred_dir,
-                            device="cuda:0",
-                            seed=run_seed,
+                    artifact_info = _inspect_target_pred_artifacts(
+                        target_pred_dir=target_pred_dir,
+                        task_name=decision_task,
+                        run_seed=run_seed,
+                    )
+                    prev_state = _read_json_obj(target_template_state)
+
+                    if bool(artifact_info.get("complete", False)):
+                        logger.info(
+                            "[pipeline] reuse existing target_pred artifacts: task=%s seed=%d success_file=%s",
+                            decision_task,
+                            int(run_seed),
+                            str(bool(artifact_info.get("has_success_file", False))).lower(),
                         )
+                        if _state_allows_target_template_reuse(
+                            state_obj=prev_state,
+                            run_id=run_id,
+                            run_seed=run_seed,
+                            decision_task=decision_task,
+                            rmsd_threshold=target_template_rmsd_thres,
+                        ):
+                            use_target_template = bool(
+                                prev_state.get("use_target_template", False)
+                            )
+                            decision_source = "reused_state"
+                            logger.info(
+                                "[pipeline] target_pred decision reused from trusted state: task=%s seed=%d use_target_template=%s",
+                                decision_task,
+                                int(run_seed),
+                                str(bool(use_target_template)).lower(),
+                            )
+                        else:
+                            logger.info(
+                                "[pipeline] target_pred complete, state untrusted; deriving decision from artifacts: task=%s seed=%d",
+                                decision_task,
+                                int(run_seed),
+                            )
+                            derived_use, derived_rmsd, derive_error = (
+                                _derive_target_template_from_existing_artifacts(
+                                    gt_cif_path=gt_cif_path,
+                                    pred_cif_path=str(
+                                        artifact_info.get("pred_cif_path") or ""
+                                    ),
+                                    rmsd_threshold=target_template_rmsd_thres,
+                                )
+                            )
+                            if derived_use is not None:
+                                use_target_template = bool(derived_use)
+                                decision_source = "artifact_derived"
+                                target_template_rmsd = (
+                                    float(derived_rmsd)
+                                    if derived_rmsd is not None
+                                    else None
+                                )
+                                rmsd_for_log = (
+                                    float(target_template_rmsd)
+                                    if target_template_rmsd is not None
+                                    else float("nan")
+                                )
+                                logger.info(
+                                    "[pipeline] target_pred artifact-derived decision: task=%s seed=%d rmsd=%.4f threshold=%.4f use_target_template=%s",
+                                    decision_task,
+                                    int(run_seed),
+                                    rmsd_for_log,
+                                    float(target_template_rmsd_thres),
+                                    str(bool(use_target_template)).lower(),
+                                )
+                            else:
+                                use_target_template = False
+                                decision_source = "emergency_fallback"
+                                logger.warning(
+                                    "[pipeline] target_pred complete, artifact derivation failed; using emergency fallback use_target_template=False: task=%s seed=%d error=%s",
+                                    decision_task,
+                                    int(run_seed),
+                                    str(derive_error),
+                                )
+                    else:
+                        logger.info(
+                            "[pipeline] target_pred incomplete, recomputing: task=%s seed=%d reason=%s",
+                            decision_task,
+                            int(run_seed),
+                            str(artifact_info.get("reason", "unknown")),
+                        )
+                        use_target_template = bool(
+                            use_target_template_or_not(
+                                configs.eval,
+                                p,
+                                gt_cif_path,
+                                (last_orig_seqs or {}).get(decision_task),
+                                decision_task,
+                                target_pred_dir,
+                                device="cuda:0",
+                                seed=run_seed,
+                            )
+                        )
+                        decision_source = "recomputed"
+                        logger.info(
+                            "[pipeline] target_pred decision recomputed: task=%s seed=%d use_target_template=%s",
+                            decision_task,
+                            int(run_seed),
+                            str(bool(use_target_template)).lower(),
+                        )
+                elif has_pending_eval:
+                    logger.warning(
+                        "[pipeline] target template decision task unavailable; using emergency fallback use_target_template=False"
                     )
                 template_attempt_token = _make_attempt_token(
                     run_id=run_id,
@@ -2031,22 +2357,37 @@ def main(argv=None):
                     world_size=int(DIST_WRAPPER.world_size),
                     attempt_ns=int(time.time_ns()),
                 )
+                target_template_state_obj: dict[str, Any] = {
+                    "run_id": int(run_id),
+                    "run_seed": int(run_seed),
+                    "world_size": int(DIST_WRAPPER.world_size),
+                    "attempt_token": str(template_attempt_token),
+                    "process_start_ns": int(_PROCESS_START_NS),
+                    "decision_task": str(decision_task or ""),
+                    "target_template_rmsd_thres": float(target_template_rmsd_thres),
+                    "decision_source": str(decision_source),
+                    "use_target_template": bool(use_target_template),
+                    "updated_ns": int(time.time_ns()),
+                    "updated_at": _iso_now(),
+                }
+                if target_template_rmsd is not None:
+                    target_template_state_obj["target_template_rmsd"] = float(
+                        target_template_rmsd
+                    )
                 _atomic_write_json(
                     target_template_state,
-                    {
-                        "run_id": int(run_id),
-                        "run_seed": int(run_seed),
-                        "world_size": int(DIST_WRAPPER.world_size),
-                        "attempt_token": str(template_attempt_token),
-                        "process_start_ns": int(_PROCESS_START_NS),
-                        "use_target_template": bool(use_target_template),
-                        "updated_ns": int(time.time_ns()),
-                        "updated_at": _iso_now(),
-                    },
+                    target_template_state_obj,
                 )
                 last_use_target_template = bool(use_target_template)
             else:
-                deadline = time.time() + 300
+                wait_timeout_s = _clamp_env_int(
+                    "PXDESIGN_TARGET_TEMPLATE_STATE_TIMEOUT_S", 300, 30, 7200
+                )
+                wait_poll_ms = _clamp_env_int(
+                    "PXDESIGN_TARGET_TEMPLATE_STATE_POLL_MS", 200, 50, 5000
+                )
+                deadline = time.time() + float(wait_timeout_s)
+                poll_s = max(float(wait_poll_ms) / 1000.0, 0.05)
                 while True:
                     state_obj = _read_json_obj(target_template_state)
                     if (
@@ -2069,7 +2410,7 @@ def main(argv=None):
                         raise RuntimeError(
                             "Timeout waiting for rank-0 target template decision."
                         )
-                    time.sleep(0.2)
+                    time.sleep(poll_s)
         else:
             last_use_target_template = False
 
