@@ -56,7 +56,13 @@ from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.seed import seed_everything
 from pxdbench.aggregate import aggregate_binder_eval
 from pxdbench.run import run_task
-from pxdbench.utils import convert_cifs_to_pdbs, str2bool
+from pxdbench.utils import (
+    convert_cif_to_pdb,
+    convert_cifs_to_pdbs,
+    find_binder_chains,
+    find_cond_chains,
+    str2bool,
+)
 
 from pxdesign.runner.helpers import save_top_designs, use_target_template_or_not
 from pxdesign.runner.inference import InferenceRunner
@@ -131,6 +137,106 @@ def _is_nonempty_file(path: str) -> bool:
         return os.path.isfile(path) and os.path.getsize(path) > 0
     except Exception:
         return False
+
+
+def _is_valid_cached_pdb(path: str, *, parse_check: bool = False) -> bool:
+    if not _is_nonempty_file(path):
+        return False
+    if not parse_check:
+        return True
+    try:
+        with open(path, "r") as f:
+            for _ in range(1024):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith(("ATOM", "HETATM")):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _ensure_writable_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(
+        path,
+        f".pxdesign_write_probe_{int(os.getpid())}_{int(time.time_ns())}",
+    )
+    with open(probe, "w") as f:
+        f.write("ok")
+    os.unlink(probe)
+
+
+def _resolve_aggregate_cache_root(
+    *,
+    task_eval_dir: str,
+    task_name: str,
+    run_id: int,
+    run_seed: int,
+) -> tuple[str, str]:
+    configured_root = str(os.environ.get("PXDESIGN_AGG_CACHE_ROOT", "") or "").strip()
+    scope_leaf = _attempt_dir_name(
+        f"task={task_name}|run={int(run_id)}|seed={int(run_seed)}"
+    )
+    default_root = os.path.join(task_eval_dir, "_cache", "cif_to_pdb", "aggregate")
+    fallback_root = os.path.join(
+        tempfile.gettempdir(),
+        "pxdesign_aggregate_cache",
+        scope_leaf,
+    )
+    candidates: list[tuple[str, str]] = []
+    if configured_root:
+        configured_base = (
+            configured_root
+            if os.path.isabs(configured_root)
+            else os.path.abspath(os.path.join(task_eval_dir, configured_root))
+        )
+        candidates.append(("configured", os.path.join(configured_base, scope_leaf)))
+    candidates.append(("eval_cache", default_root))
+    candidates.append(("tmp_fallback", fallback_root))
+
+    last_error: Exception | None = None
+    for source, path in candidates:
+        try:
+            _ensure_writable_dir(path)
+            return path, source
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "[pipeline] aggregate cache root unavailable source=%s path=%s reason=%s",
+                source,
+                path,
+                e,
+            )
+    raise RuntimeError(
+        f"Unable to create writable aggregate cache root for task={task_name}: {last_error}"
+    )
+
+
+def _prune_aggregate_attempt_dirs(agg_root: str) -> None:
+    keep_attempts = _clamp_env_int(
+        "PXDESIGN_AGG_CACHE_KEEP_ATTEMPTS",
+        8,
+        1,
+        2000,
+    )
+    try:
+        entries = [
+            p
+            for p in Path(agg_root).iterdir()
+            if p.is_dir() and p.name.startswith("attempt_")
+        ]
+    except Exception:
+        return
+    if len(entries) <= int(keep_attempts):
+        return
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in entries[int(keep_attempts) :]:
+        try:
+            shutil.rmtree(str(stale))
+        except Exception:
+            pass
 
 
 def _sha256_file(path: str) -> str:
@@ -843,6 +949,8 @@ def _chain_ids_for_hint_compare(value: Any) -> list[str]:
             continue
         if chain_s.endswith("0") and chain_s[:-1].isalpha():
             chain_s = chain_s[:-1]
+        # CIF->PDB conversion trims chain IDs to one character.
+        chain_s = chain_s[0]
         canonical.add(chain_s)
     return sorted(canonical)
 
@@ -875,6 +983,67 @@ def _extract_chain_hints_from_input(task_input: dict | None) -> tuple[list[str],
     return cond_chains, binder_chains
 
 
+def _map_chain_hints_to_observed_ids(
+    *,
+    hints: list[str],
+    observed_chain_ids: list[str],
+    task_name: str,
+    hint_label: str,
+) -> list[str]:
+    """
+    Map user-facing chain hints (e.g., A/B/C) onto observed CIF chain IDs
+    (e.g., A0/B0/C0) deterministically.
+    """
+    normalized_hints = _normalize_chain_ids(hints)
+    if not normalized_hints:
+        return []
+
+    observed = _normalize_chain_ids(observed_chain_ids)
+    if not observed:
+        raise RuntimeError(
+            f"Cannot map {hint_label} chain hints for {task_name}: no observed chains."
+        )
+
+    by_key: dict[str, list[str]] = {}
+    for chain in observed:
+        keys = _chain_ids_for_hint_compare([chain])
+        key = keys[0] if keys else str(chain).strip()[:1]
+        by_key.setdefault(key, []).append(chain)
+    for key in by_key:
+        by_key[key] = sorted(set(by_key[key]))
+
+    resolved: list[str] = []
+    missing: list[str] = []
+    for hint in normalized_hints:
+        if hint in observed:
+            resolved.append(hint)
+            continue
+
+        keys = _chain_ids_for_hint_compare([hint])
+        key = keys[0] if keys else str(hint).strip()[:1]
+        matches = list(by_key.get(key, []))
+        if not matches:
+            missing.append(hint)
+            continue
+        if len(matches) == 1:
+            resolved.append(matches[0])
+            continue
+
+        hint_s = str(hint).strip()
+        preferred = next((m for m in matches if m == f"{hint_s}0"), None)
+        if preferred is None:
+            preferred = next((m for m in matches if m.startswith(hint_s)), None)
+        resolved.append(preferred or matches[0])
+
+    if missing:
+        raise RuntimeError(
+            f"Unmatched {hint_label} chain hints for {task_name}: hints={sorted(missing)} "
+            f"observed={observed}"
+        )
+
+    return sorted(set(resolved))
+
+
 def _resolve_authoritative_chain_payload_rank0(
     *,
     task_eval_dir: str,
@@ -886,8 +1055,6 @@ def _resolve_authoritative_chain_payload_rank0(
     poll_s: int,
 ) -> dict:
     cond_hint, binder_hint = _extract_chain_hints_from_input(task_input)
-    if cond_hint and binder_hint:
-        return _chain_payload(cond_hint, binder_hint)
 
     probe_names = [str(x) for x in (probe_names or []) if str(x)]
     if not probe_names:
@@ -895,31 +1062,23 @@ def _resolve_authoritative_chain_payload_rank0(
             f"Cannot resolve chain authority for {task_name}: no probe names available."
         )
 
-    probe_root = os.path.join(task_eval_dir, "_cache", "chain_probe", task_name)
-    probe_cif_dir = os.path.join(probe_root, "cifs")
-    probe_pdb_dir = os.path.join(probe_root, "pdbs")
-    if os.path.isdir(probe_root):
-        shutil.rmtree(probe_root)
-    os.makedirs(probe_cif_dir, exist_ok=True)
-
-    selected_probe_name = None
-    deadline = time.time() + max(int(timeout_s), 1)
-    base_probe_timeout = max(1, int(timeout_s) // max(len(probe_names), 1))
-    for name in probe_names:
-        remaining = int(deadline - time.time())
-        if remaining <= 0:
-            break
-        probe_timeout = max(1, min(remaining, max(base_probe_timeout, 5)))
-        src_cif = os.path.join(struct_dir, f"{name}.cif")
-        dst_cif = os.path.join(probe_cif_dir, f"{name}.cif")
-        if _copy_with_retry(src_cif, dst_cif, timeout_s=probe_timeout, poll_s=poll_s):
-            selected_probe_name = name
-            break
-    if selected_probe_name is None:
-        raise RuntimeError(
-            f"Cannot resolve chain authority for {task_name}: failed to stage any probe CIF "
-            f"within timeout_s={int(timeout_s)}"
-        )
+    canonical_prefix = f"{task_name}_sample_"
+    canonical_names = sorted(
+        {
+            name
+            for name in probe_names
+            if str(name).strip() and str(name).startswith(canonical_prefix)
+        }
+    )
+    if not canonical_names:
+        canonical_names = sorted(set(probe_names))
+    max_primary_candidates = _clamp_env_int(
+        "PXDESIGN_CHAIN_PROBE_MAX_PRIMARY_CANDIDATES",
+        1,
+        1,
+        100000,
+    )
+    probe_candidates = canonical_names[: max(1, min(len(canonical_names), max_primary_candidates))]
 
     def _cond_hint_variants(base_hint: list[str]) -> list[list[str]]:
         normalized = _normalize_chain_ids(base_hint)
@@ -946,33 +1105,121 @@ def _resolve_authoritative_chain_payload_rank0(
             variants.append(without_suffix)
         return variants
 
-    selected_cond_hint = list(cond_hint)
-    last_assertion_error: AssertionError | None = None
-    try:
-        hint_variants = _cond_hint_variants(cond_hint) if cond_hint else [[]]
+    def _infer_chains_from_cif(
+        *,
+        name: str,
+        condition_hint: list[str] | None,
+        stage_timeout_s: int,
+    ) -> tuple[list[str], list[str]]:
+        cif_path = os.path.join(struct_dir, f"{name}.cif")
+        deadline = time.time() + max(int(stage_timeout_s), 1)
+        while True:
+            if not _is_nonempty_file(cif_path):
+                if time.time() >= deadline:
+                    raise RuntimeError(
+                        f"Cannot resolve chain authority for {task_name}: failed reading {cif_path} "
+                        f"within timeout_s={int(stage_timeout_s)} (missing or empty file)"
+                    )
+                time.sleep(max(1, int(poll_s)))
+                continue
+
+            try:
+                if condition_hint:
+                    inferred_cond_local = _normalize_chain_ids(condition_hint)
+                else:
+                    inferred_cond_local = _normalize_chain_ids(find_cond_chains(cif_path))
+                inferred_binder_local = _normalize_chain_ids(
+                    find_binder_chains(cif_path, inferred_cond_local)
+                )
+                return inferred_cond_local, inferred_binder_local
+            except Exception as e:
+                # Hinted-chain mismatches are deterministic for an existing CIF.
+                # Fail fast so caller can try the next hint variant (e.g. A -> A0)
+                # instead of waiting the full mount timeout.
+                if condition_hint:
+                    raise RuntimeError(
+                        f"Cannot resolve chain authority for {task_name}: "
+                        f"condition hint {sorted(_normalize_chain_ids(condition_hint))} "
+                        f"does not match {cif_path} ({e})"
+                    ) from e
+                if time.time() >= deadline:
+                    raise RuntimeError(
+                        f"Cannot resolve chain authority for {task_name}: failed reading {cif_path} "
+                        f"within timeout_s={int(stage_timeout_s)} ({e})"
+                    ) from e
+                time.sleep(max(1, int(poll_s)))
+
+    hint_variants = _cond_hint_variants(cond_hint) if cond_hint else [[]]
+    selected_cond_hint: list[str] = list(cond_hint)
+    inferred_cond: list[str] = []
+    inferred_binder: list[str] = []
+    selected_probe_name: Optional[str] = None
+    primary_candidate = probe_candidates[0]
+    probe_deadline = time.time() + max(int(timeout_s), 1)
+    per_probe_timeout = max(1, int(timeout_s) // max(len(probe_candidates), 1))
+    last_error: Exception | None = None
+    for probe_candidate in probe_candidates:
+        remaining = int(probe_deadline - time.time())
+        if remaining <= 0:
+            break
+        candidate_timeout = max(1, min(remaining, max(per_probe_timeout, 5)))
         for hint_variant in hint_variants:
             try:
-                _, _, inferred_cond, inferred_binder = convert_cifs_to_pdbs(
-                    probe_cif_dir,
-                    out_pdb_dir=probe_pdb_dir,
-                    condition_chains=hint_variant or None,
+                inferred_cond, inferred_binder = _infer_chains_from_cif(
+                    name=probe_candidate,
+                    condition_hint=hint_variant or None,
+                    stage_timeout_s=candidate_timeout,
                 )
+                selected_probe_name = probe_candidate
                 selected_cond_hint = list(hint_variant)
-                last_assertion_error = None
+                last_error = None
                 break
-            except AssertionError as e:
-                last_assertion_error = e
-                continue
-        if last_assertion_error is not None:
-            raise last_assertion_error
-    finally:
-        if os.path.isdir(probe_root):
-            shutil.rmtree(probe_root)
+            except Exception as e:
+                last_error = e
+        if selected_probe_name is not None:
+            break
+    if selected_probe_name is None:
+        if last_error is not None:
+            raise RuntimeError(
+                f"Cannot resolve chain authority for {task_name}: no readable probe CIF found "
+                f"within timeout_s={int(timeout_s)} candidates={int(len(probe_candidates))} "
+                f"({last_error})"
+            ) from last_error
+        raise RuntimeError(
+            f"Cannot resolve chain authority for {task_name}: no readable probe CIF found."
+        )
 
-    cond_hint = _normalize_chain_ids(selected_cond_hint)
+    if selected_probe_name != primary_candidate:
+        logger.warning(
+            "[pipeline] chain probe fallback task=%s preferred_primary=%s selected_primary=%s",
+            task_name,
+            primary_candidate,
+            selected_probe_name,
+        )
 
-    inferred_cond = _normalize_chain_ids(inferred_cond)
-    inferred_binder = _normalize_chain_ids(inferred_binder)
+    sanity_candidates = [name for name in canonical_names if name > selected_probe_name]
+    if not sanity_candidates:
+        sanity_candidates = [name for name in canonical_names if name != selected_probe_name]
+    sanity_probe_name = sanity_candidates[0] if sanity_candidates else None
+
+    selected_probe_cif = os.path.join(struct_dir, f"{selected_probe_name}.cif")
+    observed_cond = _normalize_chain_ids(find_cond_chains(selected_probe_cif))
+    observed_binder = _normalize_chain_ids(
+        find_binder_chains(selected_probe_cif, observed_cond)
+    )
+    observed_all = sorted(set(observed_cond + observed_binder))
+    cond_hint = _map_chain_hints_to_observed_ids(
+        hints=_normalize_chain_ids(selected_cond_hint),
+        observed_chain_ids=observed_all,
+        task_name=task_name,
+        hint_label="condition",
+    )
+    binder_hint = _map_chain_hints_to_observed_ids(
+        hints=binder_hint,
+        observed_chain_ids=observed_all,
+        task_name=task_name,
+        hint_label="binder",
+    )
 
     if cond_hint and inferred_cond and _canonical_hash(
         _chain_ids_for_hint_compare(cond_hint)
@@ -981,8 +1228,8 @@ def _resolve_authoritative_chain_payload_rank0(
             f"Condition chain mismatch for {task_name}: input={cond_hint} inferred={inferred_cond}"
         )
     if binder_hint and inferred_binder and _canonical_hash(
-        binder_hint
-    ) != _canonical_hash(inferred_binder):
+        _chain_ids_for_hint_compare(binder_hint)
+    ) != _canonical_hash(_chain_ids_for_hint_compare(inferred_binder)):
         raise RuntimeError(
             f"Binder chain mismatch for {task_name}: input={binder_hint} inferred={inferred_binder}"
         )
@@ -993,7 +1240,46 @@ def _resolve_authoritative_chain_payload_rank0(
         raise RuntimeError(
             f"Failed to resolve non-empty chain authority for {task_name}."
         )
-    return _chain_payload(cond_final, binder_final)
+
+    sanity_status = "skipped_no_second_sample"
+    if sanity_probe_name is not None:
+        sanity_cond, sanity_binder = _infer_chains_from_cif(
+            name=sanity_probe_name,
+            condition_hint=cond_final,
+            stage_timeout_s=timeout_s,
+        )
+        if _canonical_hash(_chain_ids_for_hint_compare(cond_final)) != _canonical_hash(
+            _chain_ids_for_hint_compare(sanity_cond)
+        ) or _canonical_hash(_chain_ids_for_hint_compare(binder_final)) != _canonical_hash(
+            _chain_ids_for_hint_compare(sanity_binder)
+        ):
+            raise RuntimeError(
+                "Chain sanity-check mismatch for "
+                f"{task_name}: expected cond={sorted(cond_final)} binder={sorted(binder_final)}; "
+                f"observed cond={sorted(sanity_cond)} binder={sorted(sanity_binder)} "
+                f"on sample={sanity_probe_name}"
+            )
+        sanity_status = "passed"
+
+    payload = _chain_payload(
+        cond_final,
+        binder_final,
+        probe_metadata={
+            "chain_probe_mode": "single_probe_one_sanity",
+            "chain_probe_primary_sample": selected_probe_name,
+            "chain_probe_sanity_sample": sanity_probe_name,
+            "chain_probe_sanity_status": sanity_status,
+        },
+    )
+    logger.info(
+        "[pipeline] chain authority resolved task=%s mode=%s primary=%s sanity=%s sanity_status=%s",
+        task_name,
+        payload.get("chain_probe_mode"),
+        payload.get("chain_probe_primary_sample"),
+        payload.get("chain_probe_sanity_sample"),
+        payload.get("chain_probe_sanity_status"),
+    )
+    return payload
 
 
 def _write_chain_authority(
@@ -1076,6 +1362,15 @@ def _rank_cache_root(task_eval_dir: str, rank: int, task_name: str) -> str:
     )
 
 
+def _shared_cache_root(task_eval_dir: str, task_name: str) -> str:
+    return os.path.join(
+        task_eval_dir,
+        "_cache",
+        "cif_to_pdb",
+        task_name,
+    )
+
+
 def _copy_with_retry(
     src: str,
     dst: str,
@@ -1112,89 +1407,199 @@ def _prepare_rank_cache(
     struct_dir: str,
     *,
     condition_chains: list[str] | None,
+    binder_chains: list[str] | None,
     timeout_s: int,
     poll_s: int,
-) -> tuple[str, list[str], list[str], list[str]]:
-    cache_dir = _rank_cache_root(task_eval_dir, rank, task_name)
-    cache_tmp_root = cache_dir + ".tmp"
+) -> tuple[str, list[str], list[str], list[str], dict[str, Any]]:
+    cache_dir = _shared_cache_root(task_eval_dir, task_name)
     owned_names = sorted(set(owned_names))
+    os.makedirs(cache_dir, exist_ok=True)
 
-    for p in (cache_tmp_root, cache_dir):
-        if os.path.isdir(p):
-            shutil.rmtree(p)
-
-    os.makedirs(cache_tmp_root, exist_ok=True)
-    staged_cif_dir = os.path.join(cache_tmp_root, "cifs")
-    staged_pdb_dir = os.path.join(cache_tmp_root, "pdbs")
-    os.makedirs(staged_cif_dir, exist_ok=True)
-
-    promoted = False
-    try:
+    incremental_enabled = _is_enabled("PXDESIGN_PDB_CACHE_INCREMENTAL", True)
+    cache_mode = "incremental" if incremental_enabled else "rebuild_owned"
+    parse_check = _is_enabled("PXDESIGN_PDB_CACHE_PARSE_CHECK", True)
+    reused_names: list[str] = []
+    missing_names: list[str] = []
+    if incremental_enabled:
         for name in owned_names:
-            src = os.path.join(struct_dir, f"{name}.cif")
-            dst = os.path.join(staged_cif_dir, f"{name}.cif")
-            ok = _copy_with_retry(src, dst, timeout_s=timeout_s, poll_s=poll_s)
-            if not ok:
-                raise RuntimeError(
-                    f"Failed to stage source CIF {src} for {task_name} rank {rank}"
-                )
+            dst = os.path.join(cache_dir, f"{name}.pdb")
+            if _is_valid_cached_pdb(dst, parse_check=parse_check):
+                reused_names.append(name)
+                continue
+            missing_names.append(name)
+    else:
+        missing_names = list(owned_names)
 
-        if owned_names:
-            pdb_dir, converted_names, new_cond_chains, new_binder_chains = (
-                convert_cifs_to_pdbs(
-                    staged_cif_dir,
-                    out_pdb_dir=staged_pdb_dir,
-                    condition_chains=condition_chains,
-                )
-            )
-            converted_names = sorted(set(converted_names))
-            if converted_names != owned_names:
-                raise RuntimeError(
-                    f"Converted CIF count mismatch for {task_name} rank {rank}: "
-                    f"expected={owned_names} got={converted_names}"
-                )
-            for name in converted_names:
-                if not _is_nonempty_file(os.path.join(staged_pdb_dir, f"{name}.pdb")):
-                    raise RuntimeError(
-                        f"Converted PDB missing or empty for {task_name} rank {rank}: {name}"
+    converted_names: list[str] = []
+    new_cond_chains = _normalize_chain_ids(condition_chains or [])
+    new_binder_chains = _normalize_chain_ids(binder_chains or [])
+
+    converted_cond_reference: list[str] = []
+    converted_binder_reference: list[str] = []
+    if missing_names:
+        for name in missing_names:
+            src_cif = os.path.join(struct_dir, f"{name}.cif")
+            dst_pdb = os.path.join(cache_dir, f"{name}.pdb")
+            tmp_pdb = dst_pdb + ".tmp"
+            deadline = time.time() + max(int(timeout_s), 1)
+            binder_for_convert = list(new_binder_chains)
+            allow_binder_fallback = True
+            while True:
+                try:
+                    if not _is_nonempty_file(src_cif):
+                        raise FileNotFoundError(src_cif)
+                    if os.path.exists(tmp_pdb):
+                        os.unlink(tmp_pdb)
+                    if not binder_for_convert:
+                        cond_for_inference = list(new_cond_chains)
+                        if not cond_for_inference:
+                            cond_for_inference = _normalize_chain_ids(
+                                find_cond_chains(src_cif)
+                            )
+                        binder_for_convert = _normalize_chain_ids(
+                            find_binder_chains(src_cif, cond_for_inference)
+                        )
+                    inferred_cond, inferred_binder = convert_cif_to_pdb(
+                        src_cif,
+                        tmp_pdb,
+                        binder_chains=binder_for_convert or None,
                     )
-        else:
-            os.makedirs(staged_pdb_dir, exist_ok=True)
-            new_cond_chains = condition_chains or []
-            converted_names = []
-            new_binder_chains = []
-            pdb_dir = staged_pdb_dir
+                    if not _is_valid_cached_pdb(tmp_pdb, parse_check=parse_check):
+                        raise RuntimeError(
+                            f"Converted PDB missing or invalid for {task_name} rank {rank}: {name}"
+                        )
+                    os.replace(tmp_pdb, dst_pdb)
+                    converted_names.append(name)
 
-        os.makedirs(os.path.dirname(cache_dir), exist_ok=True)
-        os.rename(staged_pdb_dir, cache_dir)
-        promoted = True
-    finally:
-        if promoted:
-            if os.path.isdir(cache_tmp_root):
-                shutil.rmtree(cache_tmp_root)
-        else:
-            if os.path.isdir(cache_tmp_root):
-                shutil.rmtree(cache_tmp_root)
-            if os.path.isdir(cache_dir):
-                shutil.rmtree(cache_dir)
+                    cur_cond = _normalize_chain_ids(inferred_cond)
+                    cur_binder = _normalize_chain_ids(inferred_binder)
+                    if not converted_cond_reference:
+                        converted_cond_reference = list(cur_cond)
+                    elif _canonical_hash(_chain_ids_for_hint_compare(converted_cond_reference)) != _canonical_hash(
+                        _chain_ids_for_hint_compare(cur_cond)
+                    ):
+                        raise RuntimeError(
+                            f"Condition chain mismatch across converted samples for {task_name}: "
+                            f"{converted_cond_reference} vs {cur_cond} (name={name})"
+                        )
+                    if not converted_binder_reference:
+                        converted_binder_reference = list(cur_binder)
+                    elif _canonical_hash(_chain_ids_for_hint_compare(converted_binder_reference)) != _canonical_hash(
+                        _chain_ids_for_hint_compare(cur_binder)
+                    ):
+                        raise RuntimeError(
+                            f"Binder chain mismatch across converted samples for {task_name}: "
+                            f"{converted_binder_reference} vs {cur_binder} (name={name})"
+                        )
+                    if not new_binder_chains:
+                        new_binder_chains = _normalize_chain_ids(binder_for_convert)
+                    break
+                except Exception as e:
+                    if (
+                        allow_binder_fallback
+                        and binder_for_convert
+                        and isinstance(e, ValueError)
+                    ):
+                        binder_for_convert = []
+                        new_binder_chains = []
+                        allow_binder_fallback = False
+                        continue
+                    if os.path.exists(tmp_pdb):
+                        try:
+                            os.unlink(tmp_pdb)
+                        except Exception:
+                            pass
+                    if time.time() >= deadline:
+                        raise RuntimeError(
+                            f"Failed to convert source CIF {src_cif} for {task_name} rank {rank} "
+                            f"within timeout_s={int(timeout_s)} ({e})"
+                        ) from e
+                    time.sleep(max(1, int(poll_s)))
 
-    if not promoted:
-        raise RuntimeError(
-            f"Failed to prepare rank cache for task {task_name} rank {rank}"
-        )
+        converted_names = sorted(set(converted_names))
+        if converted_names != missing_names:
+            raise RuntimeError(
+                f"Converted CIF count mismatch for {task_name} rank {rank}: "
+                f"expected={missing_names} got={converted_names}"
+            )
 
-    return cache_dir, converted_names, list(new_cond_chains), list(new_binder_chains)
+    if converted_cond_reference:
+        if new_cond_chains and _canonical_hash(
+            _chain_ids_for_hint_compare(new_cond_chains)
+        ) != _canonical_hash(_chain_ids_for_hint_compare(converted_cond_reference)):
+            raise RuntimeError(
+                f"Condition chain mismatch for {task_name} rank {rank}: "
+                f"hint={new_cond_chains} converted={converted_cond_reference}"
+            )
+        new_cond_chains = list(converted_cond_reference)
+    if converted_binder_reference:
+        if new_binder_chains and _canonical_hash(
+            _chain_ids_for_hint_compare(new_binder_chains)
+        ) != _canonical_hash(_chain_ids_for_hint_compare(converted_binder_reference)):
+            raise RuntimeError(
+                f"Binder chain mismatch for {task_name} rank {rank}: "
+                f"hint={new_binder_chains} converted={converted_binder_reference}"
+            )
+        new_binder_chains = list(converted_binder_reference)
+
+    ready_names: list[str] = []
+    for name in owned_names:
+        dst = os.path.join(cache_dir, f"{name}.pdb")
+        if not _is_valid_cached_pdb(dst, parse_check=parse_check):
+            raise RuntimeError(
+                f"Rank cache missing/invalid PDB for {task_name} rank {rank}: {name}"
+            )
+        ready_names.append(name)
+
+    logger.info(
+        "[pipeline] rank cache prepared task=%s rank=%d mode=%s pdb_reused_count=%d pdb_converted_count=%d owned_count=%d",
+        task_name,
+        int(rank),
+        cache_mode,
+        int(len(reused_names)),
+        int(len(converted_names)),
+        int(len(owned_names)),
+    )
+
+    cache_stats = {
+        "pdb_cache_mode": cache_mode,
+        "pdb_reused_count": int(len(reused_names)),
+        "pdb_converted_count": int(len(converted_names)),
+        "owned_count": int(len(owned_names)),
+        "incremental_enabled": bool(incremental_enabled),
+    }
+    return (
+        cache_dir,
+        ready_names,
+        list(new_cond_chains),
+        list(new_binder_chains),
+        cache_stats,
+    )
 
 
-def _chain_payload(cond_chains: list[str], binder_chains: list[str]) -> dict:
+def _chain_payload(
+    cond_chains: list[str],
+    binder_chains: list[str],
+    probe_metadata: Optional[dict] = None,
+) -> dict:
     cond = sorted(cond_chains)
     binder = sorted(binder_chains)
-    return {
+    payload = {
         "cond_chains": cond,
         "binder_chains": binder,
         "chain_digest": _canonical_hash(cond + binder),
         "chain_count": int(len(cond) + len(binder)),
     }
+    if isinstance(probe_metadata, dict):
+        for key in (
+            "chain_probe_mode",
+            "chain_probe_primary_sample",
+            "chain_probe_sanity_sample",
+            "chain_probe_sanity_status",
+        ):
+            if key in probe_metadata:
+                payload[key] = probe_metadata.get(key)
+    return payload
 
 
 def _validate_chain_payload(
@@ -1423,63 +1828,26 @@ def _build_aggregate_inputs(
     all_output_manifests: list[dict],
     chain_payload: dict,
     struct_dir: str,
-) -> str:
-    agg_dir = os.path.join(task_eval_dir, "_cache", "cif_to_pdb", "aggregate")
-    agg_tmp = agg_dir + ".tmp"
-    if os.path.isdir(agg_tmp):
-        shutil.rmtree(agg_tmp)
-    if os.path.isdir(agg_dir):
-        shutil.rmtree(agg_dir)
-    os.makedirs(agg_tmp, exist_ok=True)
+    attempt_token: str,
+) -> tuple[str, dict[str, int]]:
+    del attempt_token
+    parse_check = _is_enabled("PXDESIGN_PDB_CACHE_PARSE_CHECK", True)
+    shared_pdb_dir = os.path.join(task_eval_dir, "_cache", "cif_to_pdb", task_name)
+    os.makedirs(shared_pdb_dir, exist_ok=True)
 
-    manifest_by_rank: dict[int, dict] = {}
-    owner_map: dict[str, int] = {}
-    for manifest in all_output_manifests:
-        if not isinstance(manifest, dict):
-            continue
-        rank = int(manifest.get("rank", -1))
-        manifest_by_rank[rank] = manifest
-        for owned_name in manifest.get("owned_names", []) or []:
-            if owned_name in owner_map:
-                raise RuntimeError(
-                    f"Duplicate ownership detected for {owned_name} in aggregate map for {task_name}"
-                )
-            owner_map[owned_name] = rank
-
-    rank_cache_roots: list[Path] = []
-    cache_root = Path(task_eval_dir) / "_cache"
-    if cache_root.is_dir():
-        rank_cache_roots = [p for p in cache_root.glob("cif_to_pdb_rank*") if p.is_dir()]
-
-    source_by_name: dict[str, str] = {}
+    source_counts = {
+        "owner_rank_cache": 0,
+        "shared_cache": 0,
+        "other_rank_cache": 0,
+        "aggregate_fallback_converted_count": 0,
+    }
     unresolved_names: list[str] = []
-    unresolved_by_rank: dict[int, list[str]] = {}
     for name in sorted(all_pdb_names):
-        assigned = owner_map.get(name)
-        candidates: list[str] = []
-        if assigned is not None:
-            if assigned not in manifest_by_rank:
-                raise RuntimeError(
-                    f"Unknown owner rank {assigned} for {name} when building aggregate for {task_name}"
-                )
-            candidates.append(
-                os.path.join(
-                    _rank_cache_root(task_eval_dir, assigned, task_name),
-                    f"{name}.pdb",
-                )
-            )
-        candidates.append(
-            os.path.join(task_eval_dir, "_cache", "cif_to_pdb", task_name, f"{name}.pdb")
-        )
-        for root in rank_cache_roots:
-            candidates.append(str(root / task_name / f"{name}.pdb"))
-        selected = next((c for c in candidates if _is_nonempty_file(c)), None)
-        if selected is None:
-            unresolved_names.append(name)
-            rank_key = int(assigned) if assigned is not None else -1
-            unresolved_by_rank.setdefault(rank_key, []).append(name)
+        shared_path = os.path.join(shared_pdb_dir, f"{name}.pdb")
+        if _is_valid_cached_pdb(shared_path, parse_check=parse_check):
+            source_counts["shared_cache"] = int(source_counts["shared_cache"]) + 1
         else:
-            source_by_name[name] = selected
+            unresolved_names.append(name)
 
     if unresolved_names:
         rehydrate_timeout = _clamp_env_int(
@@ -1488,66 +1856,73 @@ def _build_aggregate_inputs(
         rehydrate_poll = _clamp_env_int(
             "PXDESIGN_STAGEIN_SOURCE_POLL_S", 10, 2, 60
         )
-        rehydrate_cif_dir = os.path.join(agg_tmp, "_rehydrate_cifs")
-        rehydrate_pdb_dir = os.path.join(agg_tmp, "_rehydrate_pdbs")
-        os.makedirs(rehydrate_cif_dir, exist_ok=True)
-        for name in unresolved_names:
-            src_cif = os.path.join(struct_dir, f"{name}.cif")
-            dst_cif = os.path.join(rehydrate_cif_dir, f"{name}.cif")
-            if not _copy_with_retry(
-                src_cif,
-                dst_cif,
-                timeout_s=rehydrate_timeout,
-                poll_s=rehydrate_poll,
-            ):
-                missing_detail = "; ".join(
-                    [
-                        f"rank={rk}:names={','.join(sorted(vals))}"
-                        for rk, vals in sorted(unresolved_by_rank.items(), key=lambda x: x[0])
-                    ]
-                )
-                raise RuntimeError(
-                    f"Missing required aggregate source CIF for {task_name}: {src_cif}; "
-                    f"missing_by_rank={missing_detail}"
-                )
-        _, converted_names, _, _ = convert_cifs_to_pdbs(
-            rehydrate_cif_dir,
-            out_pdb_dir=rehydrate_pdb_dir,
-            condition_chains=_normalize_chain_ids((chain_payload or {}).get("cond_chains")) or None,
+        rehydrate_tmp = tempfile.mkdtemp(
+            prefix=f"aggregate_rehydrate_{task_name}_",
+            dir=shared_pdb_dir,
         )
-        converted_set = set(converted_names or [])
-        for name in unresolved_names:
-            if name not in converted_set:
-                raise RuntimeError(
-                    f"Failed to rehydrate missing aggregate PDB for {task_name}: {name}"
-                )
-            src = os.path.join(rehydrate_pdb_dir, f"{name}.pdb")
-            if not _is_nonempty_file(src):
-                raise RuntimeError(
-                    f"Rehydrated aggregate PDB missing or empty for {task_name}: {src}"
-                )
-            source_by_name[name] = src
+        rehydrate_cif_dir = os.path.join(rehydrate_tmp, "cifs")
+        rehydrate_pdb_dir = os.path.join(rehydrate_tmp, "pdbs")
+        os.makedirs(rehydrate_cif_dir, exist_ok=True)
+        try:
+            for name in unresolved_names:
+                src_cif = os.path.join(struct_dir, f"{name}.cif")
+                dst_cif = os.path.join(rehydrate_cif_dir, f"{name}.cif")
+                if not _copy_with_retry(
+                    src_cif,
+                    dst_cif,
+                    timeout_s=rehydrate_timeout,
+                    poll_s=rehydrate_poll,
+                ):
+                    raise RuntimeError(
+                        f"Missing required aggregate source CIF for {task_name}: {src_cif}"
+                    )
+            _, converted_names, _, _ = convert_cifs_to_pdbs(
+                rehydrate_cif_dir,
+                out_pdb_dir=rehydrate_pdb_dir,
+                condition_chains=_normalize_chain_ids((chain_payload or {}).get("cond_chains")) or None,
+            )
+            converted_set = set(converted_names or [])
+            source_counts["aggregate_fallback_converted_count"] = int(len(converted_set))
+            for name in unresolved_names:
+                if name not in converted_set:
+                    raise RuntimeError(
+                        f"Failed to rehydrate missing aggregate PDB for {task_name}: {name}"
+                    )
+                src = os.path.join(rehydrate_pdb_dir, f"{name}.pdb")
+                if not _is_valid_cached_pdb(src, parse_check=parse_check):
+                    raise RuntimeError(
+                        f"Rehydrated aggregate PDB missing or invalid for {task_name}: {src}"
+                    )
+                dst = os.path.join(shared_pdb_dir, f"{name}.pdb")
+                dst_tmp = f"{dst}.rehydrate_tmp_{int(time.time_ns())}"
+                try:
+                    if os.path.exists(dst_tmp):
+                        os.unlink(dst_tmp)
+                    try:
+                        os.link(src, dst_tmp)
+                    except Exception:
+                        shutil.copy2(src, dst_tmp)
+                    os.replace(dst_tmp, dst)
+                finally:
+                    if os.path.exists(dst_tmp):
+                        try:
+                            os.unlink(dst_tmp)
+                        except Exception:
+                            pass
+                if not _is_valid_cached_pdb(dst, parse_check=parse_check):
+                    raise RuntimeError(
+                        f"Failed to install rehydrated aggregate PDB for {task_name}: {dst}"
+                    )
+        finally:
+            shutil.rmtree(rehydrate_tmp, ignore_errors=True)
 
     for name in sorted(all_pdb_names):
-        src = source_by_name.get(name)
-        if not src or not _is_nonempty_file(src):
+        src = os.path.join(shared_pdb_dir, f"{name}.pdb")
+        if not _is_valid_cached_pdb(src, parse_check=parse_check):
             raise RuntimeError(
-                f"Missing required aggregate source {name} while building {task_name}"
+                f"Missing required aggregate source {name} in shared cache for {task_name}"
             )
-        dst = os.path.join(agg_tmp, f"{name}.pdb")
-        try:
-            os.link(src, dst)
-        except Exception:
-            shutil.copy2(src, dst)
-        if not _is_nonempty_file(dst):
-            raise RuntimeError(f"Aggregate link/copy produced empty output for {name}")
 
-    for tmp_name in ("_rehydrate_cifs", "_rehydrate_pdbs"):
-        tmp_path = os.path.join(agg_tmp, tmp_name)
-        if os.path.isdir(tmp_path):
-            shutil.rmtree(tmp_path)
-
-    os.rename(agg_tmp, agg_dir)
     aggregate_inputs = {
         "run_id": int(run_id),
         "run_seed": int(run_seed),
@@ -1563,11 +1938,34 @@ def _build_aggregate_inputs(
             }
             for manifest in all_output_manifests
         },
-        "aggregate_pdb_dir": agg_dir,
+        "aggregate_pdb_dir": shared_pdb_dir,
+        "source_counts": dict(source_counts),
         "updated_at": _iso_now(),
     }
-    _atomic_write_json(os.path.join(task_eval_dir, "aggregate_inputs.json"), aggregate_inputs)
-    return agg_dir
+    aggregate_inputs_path = os.path.join(task_eval_dir, "aggregate_inputs.json")
+    try:
+        _atomic_write_json(aggregate_inputs_path, aggregate_inputs)
+    except Exception as e:
+        fallback_inputs_path = os.path.join(shared_pdb_dir, "aggregate_inputs.json")
+        logger.warning(
+            "[pipeline] aggregate_inputs write fallback task=%s primary=%s fallback=%s reason=%s",
+            task_name,
+            aggregate_inputs_path,
+            fallback_inputs_path,
+            e,
+        )
+        _atomic_write_json(fallback_inputs_path, aggregate_inputs)
+
+    logger.info(
+        "[pipeline] aggregate inputs task=%s root_source=%s owner_rank_cache=%d shared_cache=%d other_rank_cache=%d aggregate_fallback_converted_count=%d",
+        task_name,
+        "shared_cache",
+        int(source_counts["owner_rank_cache"]),
+        int(source_counts["shared_cache"]),
+        int(source_counts["other_rank_cache"]),
+        int(source_counts["aggregate_fallback_converted_count"]),
+    )
+    return shared_pdb_dir, dict(source_counts)
 
 
 def _wait_for_shards_ready(
@@ -2499,7 +2897,7 @@ def main(argv=None):
                     task_eval_dir=task_eval_dir,
                     task_name=task_name,
                     struct_dir=struct_dir,
-                    probe_names=pending_names or pdb_names,
+                    probe_names=pdb_names,
                     task_input=task_input_by_name.get(task_name),
                     timeout_s=stagein_timeout,
                     poll_s=stagein_poll,
@@ -2521,6 +2919,28 @@ def main(argv=None):
                     pending_names_digest=pending_names_digest,
                     chain_payload=authoritative_chain_payload,
                 )
+                if hb is not None:
+                    hb.touch(
+                        extra={
+                            "eval_metrics": {
+                                "task": task_name,
+                                "chain_probe_mode": authoritative_chain_payload.get(
+                                    "chain_probe_mode"
+                                ),
+                                "chain_probe_primary_sample": authoritative_chain_payload.get(
+                                    "chain_probe_primary_sample"
+                                ),
+                                "chain_probe_sanity_sample": authoritative_chain_payload.get(
+                                    "chain_probe_sanity_sample"
+                                ),
+                                "chain_probe_sanity_status": authoritative_chain_payload.get(
+                                    "chain_probe_sanity_status"
+                                ),
+                            }
+                        },
+                        primary_counter="eval_designs",
+                        force=True,
+                    )
 
             chain_authority_obj = _wait_for_chain_authority(
                 task_eval_dir=task_eval_dir,
@@ -2541,16 +2961,41 @@ def main(argv=None):
             cond_chains = list(authoritative_chain_payload.get("cond_chains", []))
             binder_chains = list(authoritative_chain_payload.get("binder_chains", []))
 
-            pdb_dir, converted_names, local_cond_chains, local_binder_chains = _prepare_rank_cache(
+            (
+                pdb_dir,
+                ready_pdb_names,
+                local_cond_chains,
+                local_binder_chains,
+                rank_cache_stats,
+            ) = _prepare_rank_cache(
                 task_eval_dir=task_eval_dir,
                 task_name=task_name,
                 rank=int(DIST_WRAPPER.rank),
                 owned_names=my_owned_names,
                 struct_dir=struct_dir,
                 condition_chains=cond_chains or None,
+                binder_chains=binder_chains or None,
                 timeout_s=stagein_timeout,
                 poll_s=stagein_poll,
             )
+            if hb is not None:
+                hb.touch(
+                    extra={
+                        "eval_metrics": {
+                            "task": task_name,
+                            "rank": int(DIST_WRAPPER.rank),
+                            "pdb_cache_mode": rank_cache_stats.get("pdb_cache_mode"),
+                            "pdb_reused_count": int(
+                                rank_cache_stats.get("pdb_reused_count", 0)
+                            ),
+                            "pdb_converted_count": int(
+                                rank_cache_stats.get("pdb_converted_count", 0)
+                            ),
+                        }
+                    },
+                    primary_counter="eval_designs",
+                    force=True,
+                )
 
             local_chain_payload = _chain_payload(local_cond_chains, local_binder_chains)
             if my_owned_names:
@@ -2561,9 +3006,9 @@ def main(argv=None):
                         f"[pipeline] Rank {int(DIST_WRAPPER.rank)} chain mismatch for task {task_name}"
                     )
 
-            if sorted(converted_names) != sorted(my_owned_names):
+            if sorted(ready_pdb_names) != sorted(my_owned_names):
                 raise RuntimeError(
-                    f"[pipeline] Rank {int(DIST_WRAPPER.rank)} conversion mismatch for task {task_name}"
+                    f"[pipeline] Rank {int(DIST_WRAPPER.rank)} cache readiness mismatch for task {task_name}"
                 )
 
             _update_eval_heartbeat(
@@ -2704,7 +3149,7 @@ def main(argv=None):
                     expected_chain_payload=chain_payload,
                 )
 
-                aggregate_pdb_dir = _build_aggregate_inputs(
+                aggregate_pdb_dir, aggregate_source_counts = _build_aggregate_inputs(
                     task_eval_dir=task_eval_dir,
                     task_name=task_name,
                     run_id=run_id,
@@ -2714,7 +3159,32 @@ def main(argv=None):
                     all_output_manifests=ready_manifests,
                     chain_payload=chain_payload,
                     struct_dir=struct_dir,
+                    attempt_token=attempt_token,
                 )
+                if hb is not None:
+                    hb.touch(
+                        extra={
+                            "eval_metrics": {
+                                "task": task_name,
+                                "aggregate_fallback_converted_count": int(
+                                    aggregate_source_counts.get(
+                                        "aggregate_fallback_converted_count", 0
+                                    )
+                                ),
+                                "aggregate_owner_rank_cache_count": int(
+                                    aggregate_source_counts.get("owner_rank_cache", 0)
+                                ),
+                                "aggregate_shared_cache_count": int(
+                                    aggregate_source_counts.get("shared_cache", 0)
+                                ),
+                                "aggregate_other_rank_cache_count": int(
+                                    aggregate_source_counts.get("other_rank_cache", 0)
+                                ),
+                            }
+                        },
+                        primary_counter="eval_designs",
+                        force=True,
+                    )
 
                 if not pdb_names:
                     continue
@@ -2737,13 +3207,19 @@ def main(argv=None):
                     interval_s=eval_hb_interval,
                     extra={"eval_step": "aggregate"},
                 )
+                aggregate_cond_chains = _chain_ids_for_hint_compare(
+                    chain_payload.get("cond_chains", [])
+                )
+                aggregate_binder_chains = _chain_ids_for_hint_compare(
+                    chain_payload.get("binder_chains", [])
+                )
                 aggregate_binder_eval(
                     task_name=task_name,
                     eval_dir=task_eval_dir,
                     pdb_dir=aggregate_pdb_dir,
                     pdb_names=pdb_names,
-                    cond_chains=chain_payload.get("cond_chains", []),
-                    binder_chains=chain_payload.get("binder_chains", []),
+                    cond_chains=aggregate_cond_chains,
+                    binder_chains=aggregate_binder_chains,
                     cfg=configs.eval.binder,
                     seed=run_seed,
                     analysis_workers=int(p.get("analysis_workers")),
