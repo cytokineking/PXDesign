@@ -38,6 +38,7 @@ multiple tasks in one input by keeping a per-task active set for early-stop.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -157,15 +158,71 @@ def _is_valid_cached_pdb(path: str, *, parse_check: bool = False) -> bool:
     return False
 
 
+_PERSISTENT_WRITE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
+
+
 def _ensure_writable_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
     probe = os.path.join(
         path,
         f".pxdesign_write_probe_{int(os.getpid())}_{int(time.time_ns())}",
     )
-    with open(probe, "w") as f:
-        f.write("ok")
-    os.unlink(probe)
+    try:
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.unlink(probe)
+    except Exception:
+        try:
+            if os.path.exists(probe):
+                os.unlink(probe)
+        except Exception:
+            pass
+        raise
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+def _is_persistent_write_error(exc: BaseException) -> bool:
+    for cur in _iter_exception_chain(exc):
+        if isinstance(cur, OSError) and getattr(cur, "errno", None) in _PERSISTENT_WRITE_ERRNOS:
+            return True
+        msg = str(cur).lower()
+        if (
+            "read-only file system" in msg
+            or "[errno 30]" in msg
+            or "permission denied" in msg
+            or "operation not permitted" in msg
+        ):
+            return True
+    return False
+
+
+def _exception_mentions_any_path(exc: BaseException, paths: list[str]) -> bool:
+    norm_paths = [os.path.normpath(p) for p in paths if p]
+    if not norm_paths:
+        return False
+    for cur in _iter_exception_chain(exc):
+        for attr in ("filename", "filename2"):
+            value = getattr(cur, attr, None)
+            if not value:
+                continue
+            try:
+                candidate = os.path.normpath(str(value))
+            except Exception:
+                continue
+            if any(candidate == p or candidate.startswith(p + os.sep) for p in norm_paths):
+                return True
+        msg = str(cur)
+        if any(p in msg for p in norm_paths):
+            return True
+    return False
 
 
 def _resolve_aggregate_cache_root(
@@ -1413,7 +1470,19 @@ def _prepare_rank_cache(
 ) -> tuple[str, list[str], list[str], list[str], dict[str, Any]]:
     cache_dir = _shared_cache_root(task_eval_dir, task_name)
     owned_names = sorted(set(owned_names))
-    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        _ensure_writable_dir(cache_dir)
+    except Exception as e:
+        logger.error(
+            "[pipeline] rank cache root unavailable source=eval_cache task=%s rank=%d path=%s reason=%s",
+            task_name,
+            int(rank),
+            cache_dir,
+            e,
+        )
+        raise RuntimeError(
+            f"Rank cache root is not writable for {task_name} rank {rank}: {cache_dir} ({e})"
+        ) from e
 
     incremental_enabled = _is_enabled("PXDESIGN_PDB_CACHE_INCREMENTAL", True)
     cache_mode = "incremental" if incremental_enabled else "rebuild_owned"
@@ -1421,14 +1490,48 @@ def _prepare_rank_cache(
     reused_names: list[str] = []
     missing_names: list[str] = []
     if incremental_enabled:
-        for name in owned_names:
+        validation_start = time.time()
+        last_validation_log = validation_start
+        logger.info(
+            "[pipeline] rank cache validation start task=%s rank=%d owned=%d parse_check=%s cache_dir=%s",
+            task_name,
+            int(rank),
+            int(len(owned_names)),
+            str(bool(parse_check)).lower(),
+            cache_dir,
+        )
+        for idx, name in enumerate(owned_names, start=1):
             dst = os.path.join(cache_dir, f"{name}.pdb")
             if _is_valid_cached_pdb(dst, parse_check=parse_check):
                 reused_names.append(name)
-                continue
-            missing_names.append(name)
+            else:
+                missing_names.append(name)
+            now = time.time()
+            if idx == len(owned_names) or idx % 1000 == 0 or now - last_validation_log >= 30:
+                logger.info(
+                    "[pipeline] rank cache validation progress task=%s rank=%d checked=%d reused=%d missing=%d owned=%d cache_dir=%s",
+                    task_name,
+                    int(rank),
+                    int(idx),
+                    int(len(reused_names)),
+                    int(len(missing_names)),
+                    int(len(owned_names)),
+                    cache_dir,
+                )
+                last_validation_log = now
     else:
         missing_names = list(owned_names)
+
+    logger.info(
+        "[pipeline] rank cache start task=%s rank=%d owned=%d reused=%d missing=%d parse_check=%s cache_source=eval_cache cache_dir=%s",
+        task_name,
+        int(rank),
+        int(len(owned_names)),
+        int(len(reused_names)),
+        int(len(missing_names)),
+        str(bool(parse_check)).lower(),
+        cache_dir,
+    )
 
     converted_names: list[str] = []
     new_cond_chains = _normalize_chain_ids(condition_chains or [])
@@ -1437,6 +1540,7 @@ def _prepare_rank_cache(
     converted_cond_reference: list[str] = []
     converted_binder_reference: list[str] = []
     if missing_names:
+        last_convert_log = time.time()
         for name in missing_names:
             src_cif = os.path.join(struct_dir, f"{name}.cif")
             dst_pdb = os.path.join(cache_dir, f"{name}.pdb")
@@ -1470,6 +1574,20 @@ def _prepare_rank_cache(
                         )
                     os.replace(tmp_pdb, dst_pdb)
                     converted_names.append(name)
+                    now = time.time()
+                    if len(converted_names) == len(missing_names) or len(converted_names) % 100 == 0 or now - last_convert_log >= 30:
+                        logger.info(
+                            "[pipeline] rank cache progress task=%s rank=%d mode=%s reused=%d converted=%d missing=%d owned=%d cache_dir=%s",
+                            task_name,
+                            int(rank),
+                            cache_mode,
+                            int(len(reused_names)),
+                            int(len(converted_names)),
+                            int(len(missing_names) - len(converted_names)),
+                            int(len(owned_names)),
+                            cache_dir,
+                        )
+                        last_convert_log = now
 
                     cur_cond = _normalize_chain_ids(inferred_cond)
                     cur_binder = _normalize_chain_ids(inferred_binder)
@@ -1504,6 +1622,20 @@ def _prepare_rank_cache(
                         new_binder_chains = []
                         allow_binder_fallback = False
                         continue
+                    if _is_persistent_write_error(e) and _exception_mentions_any_path(
+                        e,
+                        [cache_dir, tmp_pdb, dst_pdb],
+                    ):
+                        logger.error(
+                            "[pipeline] rank cache write failed task=%s rank=%d path=%s reason=%s",
+                            task_name,
+                            int(rank),
+                            dst_pdb,
+                            e,
+                        )
+                        raise RuntimeError(
+                            f"Persistent rank cache write error for {task_name} rank {rank}: {dst_pdb} ({e})"
+                        ) from e
                     if os.path.exists(tmp_pdb):
                         try:
                             os.unlink(tmp_pdb)
@@ -1850,6 +1982,19 @@ def _build_aggregate_inputs(
             unresolved_names.append(name)
 
     if unresolved_names:
+        try:
+            _ensure_writable_dir(shared_pdb_dir)
+        except Exception as e:
+            logger.error(
+                "[pipeline] aggregate shared cache unavailable task=%s path=%s unresolved=%d reason=%s",
+                task_name,
+                shared_pdb_dir,
+                int(len(unresolved_names)),
+                e,
+            )
+            raise RuntimeError(
+                f"Aggregate shared cache is not writable for {task_name}: {shared_pdb_dir} ({e})"
+            ) from e
         rehydrate_timeout = _clamp_env_int(
             "PXDESIGN_STAGEIN_SOURCE_TIMEOUT_S", 900, 30, 7200
         )
