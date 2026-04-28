@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import json
+import logging
 import os
+import shutil
 
 import pandas as pd
 
@@ -23,6 +26,10 @@ from pxdbench.tools.protmpnn.mpnn_predictor import MPNNPredictor
 from pxdbench.utils import save_eval_results
 
 from .registry import register_task
+
+logger = logging.getLogger(__name__)
+
+_CANONICAL_AA = frozenset("ACDEFGHIKLMNPQRSTVWY")
 
 
 @register_task("binder")
@@ -56,6 +63,10 @@ class BinderTask(BaseTask):
             self.orig_seqs = input_data["orig_seqs"]
         else:
             self.orig_seqs = None
+        self.reuse_persisted_sequences = bool(
+            input_data.get("reuse_persisted_sequences", False)
+        )
+        self._sequence_overwrite_keys: set[tuple[str, int]] = set()
 
         # Default values
         self.use_binder_seq_list = cfg.get("use_binder_seq_list", False)
@@ -81,6 +92,221 @@ class BinderTask(BaseTask):
                 datas.append(data)
         return datas
 
+    def _seq_cache_path(self, name: str, seq_idx: int) -> str:
+        return os.path.join(self.out_dir, "seqs", f"{name}_seq{int(seq_idx)}.txt")
+
+    @staticmethod
+    def _read_cached_sequence(path: str) -> tuple[str, str | None, str | None]:
+        if not os.path.exists(path):
+            return "missing", None, None
+        if not os.path.isfile(path):
+            return "corrupt", None, "not a regular file"
+        try:
+            with open(path, "r") as f:
+                seq = f.read().strip()
+        except OSError as exc:
+            return "corrupt", None, f"read failed: {exc}"
+        if not seq:
+            return "corrupt", None, "empty sequence"
+        if seq != seq.upper():
+            return "corrupt", None, "sequence is not uppercase"
+        invalid = sorted({aa for aa in seq if aa not in _CANONICAL_AA})
+        if invalid:
+            return "corrupt", None, f"invalid residues: {''.join(invalid)}"
+        return "valid", seq, None
+
+    def _downstream_artifact_paths(self, name: str, seq_idx: int) -> list[str]:
+        design_name = f"{name}_seq{int(seq_idx)}"
+        af2_dir = os.path.join(self.out_dir, "af2_pred")
+        paths = []
+        for pattern in (
+            os.path.join(af2_dir, f"{design_name}_model*.json"),
+            os.path.join(af2_dir, f"{design_name}_model*.pdb"),
+            os.path.join(af2_dir, f"{design_name}_MONOMER_ONLY_model*.json"),
+            os.path.join(af2_dir, f"{design_name}_MONOMER_ONLY_model*.pdb"),
+        ):
+            paths.extend(glob.glob(pattern))
+        for dirname in ("ptx_mini_pred", "ptx_pred"):
+            pred_dir = os.path.join(self.out_dir, dirname, design_name)
+            if os.path.exists(pred_dir):
+                paths.append(pred_dir)
+        return sorted(set(paths))
+
+    @staticmethod
+    def _remove_visible_artifact(path: str) -> None:
+        if not os.path.exists(path):
+            return
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to invalidate stale downstream artifact {path}: {exc}"
+            ) from exc
+        if os.path.exists(path):
+            raise RuntimeError(
+                f"Failed to invalidate stale downstream artifact {path}: "
+                "artifact remains visible after removal"
+            )
+
+    def _invalidate_downstream_outputs(self, name: str, seq_indices) -> int:
+        invalidated = 0
+        for seq_idx in seq_indices:
+            for path in self._downstream_artifact_paths(name, int(seq_idx)):
+                self._remove_visible_artifact(path)
+                invalidated += 1
+        return invalidated
+
+    def _run_mpnn(self, pdb_names: list[str], verbose=True):
+        mpnn_predictor = MPNNPredictor(
+            self.cfg.tools.mpnn,
+            device_id=self.device_id,
+            verbose=verbose,
+            seed=self.seed,
+        )
+        return mpnn_predictor.design_binder(
+            self.pdb_dir,
+            pdb_names,
+            self.num_seqs,
+            binder_chains=self.binder_chains,
+            cond_chains=self.cond_chains,
+        )
+
+    def _design_sequence_with_cache(self, verbose=True):
+        num_seqs = int(self.num_seqs)
+        cached_results: dict[tuple[str, int], dict] = {}
+        generate_names: list[str] = []
+        overwrite_keys: set[tuple[str, int]] = set()
+        corrupt_count = 0
+        invalidated_count = 0
+
+        for name in self.pdb_names:
+            status_rows = []
+            for seq_idx in range(num_seqs):
+                path = self._seq_cache_path(name, seq_idx)
+                status, seq, reason = self._read_cached_sequence(path)
+                status_rows.append((seq_idx, status, seq, reason, path))
+
+            if num_seqs == 1:
+                seq_idx, status, seq, reason, path = status_rows[0]
+                key = (name, seq_idx)
+                if status == "valid":
+                    cached_results[key] = {
+                        "name": name,
+                        "seq_idx": seq_idx,
+                        "sequence": seq,
+                    }
+                    continue
+                if status == "corrupt":
+                    logger.warning(
+                        "Recovering corrupt MPNN sequence cache task=%s name=%s "
+                        "seq_idx=%d path=%s reason=%s",
+                        self.task_name,
+                        name,
+                        seq_idx,
+                        path,
+                        reason,
+                    )
+                    invalidated_count += self._invalidate_downstream_outputs(
+                        name, [seq_idx]
+                    )
+                    overwrite_keys.add(key)
+                    corrupt_count += 1
+                else:
+                    invalidated_count += self._invalidate_downstream_outputs(
+                        name, [seq_idx]
+                    )
+                generate_names.append(name)
+                continue
+
+            statuses = [row[1] for row in status_rows]
+            if all(status == "valid" for status in statuses):
+                for seq_idx, _, seq, _, _ in status_rows:
+                    cached_results[(name, seq_idx)] = {
+                        "name": name,
+                        "seq_idx": seq_idx,
+                        "sequence": seq,
+                    }
+                continue
+            if all(status == "missing" for status in statuses):
+                invalidated_count += self._invalidate_downstream_outputs(
+                    name, range(num_seqs)
+                )
+                generate_names.append(name)
+                continue
+            if any(status == "corrupt" for status in statuses):
+                reasons = [
+                    f"seq{seq_idx}:{reason}"
+                    for seq_idx, status, _, reason, _ in status_rows
+                    if status == "corrupt"
+                ]
+                logger.warning(
+                    "Recovering corrupt multi-sequence MPNN cache task=%s name=%s "
+                    "num_seqs=%d reasons=%s",
+                    self.task_name,
+                    name,
+                    num_seqs,
+                    ",".join(reasons),
+                )
+                seq_indices = list(range(num_seqs))
+                invalidated_count += self._invalidate_downstream_outputs(
+                    name, seq_indices
+                )
+                for seq_idx in seq_indices:
+                    overwrite_keys.add((name, seq_idx))
+                corrupt_count += sum(status == "corrupt" for status in statuses)
+                generate_names.append(name)
+                continue
+
+            details = ", ".join(
+                f"seq{seq_idx}:{status}"
+                for seq_idx, status, _, _, _ in status_rows
+            )
+            raise RuntimeError(
+                "Unsupported partial MPNN sequence cache for "
+                f"task={self.task_name} name={name} num_seqs={num_seqs}: {details}"
+            )
+
+        generated_results = (
+            self._run_mpnn(generate_names, verbose=verbose) if generate_names else []
+        )
+        result_by_key = dict(cached_results)
+        for item in generated_results:
+            key = (str(item["name"]), int(item["seq_idx"]))
+            if key in result_by_key:
+                raise RuntimeError(
+                    f"Duplicate MPNN sequence result for task={self.task_name} "
+                    f"name={key[0]} seq_idx={key[1]}"
+                )
+            result_by_key[key] = item
+
+        ordered_results = []
+        for name in self.pdb_names:
+            for seq_idx in range(num_seqs):
+                key = (name, seq_idx)
+                if key not in result_by_key:
+                    raise RuntimeError(
+                        f"Missing MPNN sequence result for task={self.task_name} "
+                        f"name={name} seq_idx={seq_idx}"
+                    )
+                ordered_results.append(result_by_key[key])
+
+        self._sequence_overwrite_keys = overwrite_keys
+        logger.info(
+            "mpnn sequence cache task=%s cached_name_seq=%d generated_names=%d "
+            "num_seqs=%d corrupt_name_seq=%d invalidated_artifacts=%d seq_dir=%s",
+            self.task_name,
+            len(cached_results),
+            len(generate_names),
+            num_seqs,
+            corrupt_count,
+            invalidated_count,
+            os.path.join(self.out_dir, "seqs"),
+        )
+        return ordered_results
+
     def design_sequence(self, verbose=True):
         """
         Generates binder sequences based on task configuration.
@@ -96,26 +322,17 @@ class BinderTask(BaseTask):
         Returns:
             list[dict]: List of design results with keys "name", "seq_idx", and "sequence".
         """
+        self._sequence_overwrite_keys = set()
         if self.use_binder_seq_list:
             results = self.prepare_data_from_seq_list()
         elif self.use_gt_seq:
             results = get_gt_sequence(
                 self.pdb_dir, self.pdb_names, self.binder_chains[0]
             )
+        elif self.reuse_persisted_sequences:
+            results = self._design_sequence_with_cache(verbose=verbose)
         else:
-            mpnn_predictor = MPNNPredictor(
-                self.cfg.tools.mpnn,
-                device_id=self.device_id,
-                verbose=verbose,
-                seed=self.seed,
-            )
-            results = mpnn_predictor.design_binder(
-                self.pdb_dir,
-                self.pdb_names,
-                self.num_seqs,
-                binder_chains=self.binder_chains,
-                cond_chains=self.cond_chains,
-            )
+            results = self._run_mpnn(self.pdb_names, verbose=verbose)
         return results
 
     def run(self):
@@ -133,7 +350,7 @@ class BinderTask(BaseTask):
         """
         results = self.design_sequence()
         self.check_results(results)
-        self.persist_sequences(results)
+        self.persist_sequences(results, overwrite_keys=self._sequence_overwrite_keys)
         binder_chain = self.binder_chains[0]
 
         af2_pred_path = os.path.join(self.out_dir, "af2_pred")

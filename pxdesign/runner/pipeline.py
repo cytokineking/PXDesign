@@ -3185,6 +3185,7 @@ def main(argv=None):
                     "out_dir": task_eval_dir,
                     "orig_seqs": last_orig_seqs.get(task_name),
                     "pred_only": True,
+                    "reuse_persisted_sequences": True,
                 }
                 eval_hb_interval = float(
                     os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30

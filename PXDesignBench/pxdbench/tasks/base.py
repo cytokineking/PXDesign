@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import tempfile
 from abc import ABC, abstractmethod
 from functools import cached_property
 from typing import Optional
@@ -252,14 +253,38 @@ class BaseTask(ABC):
             )
         return
 
-    def persist_sequences(self, results):
+    @staticmethod
+    def _atomic_write_text(path: str, text: str) -> None:
+        directory = os.path.dirname(path)
+        basename = os.path.basename(path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{basename}.",
+            suffix=".tmp",
+            dir=directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def persist_sequences(self, results, overwrite_keys=None):
         """
         Persist per-sample sequences for aggregation/resume.
 
         Writes one file per (name, seq_idx) under <out_dir>/seqs/.
+        Existing sequence files are preserved unless their (name, seq_idx)
+        key is explicitly included in overwrite_keys.
         """
         seq_dir = os.path.join(self.out_dir, "seqs")
         os.makedirs(seq_dir, exist_ok=True)
+        overwrite_keys = set(overwrite_keys or ())
         for item in results:
             seq = item.get("sequence")
             if not seq:
@@ -268,11 +293,18 @@ class BaseTask(ABC):
             seq_idx = item.get("seq_idx")
             if name is None or seq_idx is None:
                 continue
-            seq_path = os.path.join(seq_dir, f"{name}_seq{int(seq_idx)}.txt")
-            if os.path.exists(seq_path):
+            name = str(name)
+            key = (name, int(seq_idx))
+            seq_path = os.path.join(seq_dir, f"{name}_seq{key[1]}.txt")
+            if os.path.exists(seq_path) and key not in overwrite_keys:
                 continue
-            with open(seq_path, "w") as f:
-                f.write(seq)
+            self._atomic_write_text(seq_path, str(seq))
+            with open(seq_path, "r") as f:
+                persisted = f.read()
+            if persisted != str(seq):
+                raise RuntimeError(
+                    f"Sequence persistence verification failed for {seq_path}"
+                )
 
     def af2_complex_predict(self, data_list, save_dir, verbose=True):
         """
