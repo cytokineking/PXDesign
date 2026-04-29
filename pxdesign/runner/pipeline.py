@@ -81,6 +81,14 @@ from pxdesign.utils.pipeline import check_tool_weights
 logger = logging.getLogger(__name__)
 _PROCESS_START_NS = int(time.time_ns())
 
+EVAL_TOOL_ORDER = ("af2_complex", "af2_monomer", "ptx_mini", "ptx")
+EVAL_TOOL_GROUP = {
+    "af2_complex": "af2_eval",
+    "af2_monomer": "af2_eval",
+    "ptx_mini": "protenix_eval",
+    "ptx": "protenix_eval",
+}
+
 
 # -----------------------------------------------------------------------------
 # Small utilities
@@ -372,6 +380,42 @@ def _start_heartbeat_keepalive(
     return stop, thread
 
 
+def _start_eval_heartbeat_keepalive(
+    hb: Optional[HeartbeatReporter],
+    *,
+    interval_s: float,
+    task_name: str,
+    task_eval_dir: str,
+    pdb_names: list[str],
+    eval_cfg,
+    seed: int,
+    step: str,
+) -> Optional[tuple[threading.Event, threading.Thread]]:
+    if hb is None or interval_s <= 0:
+        return None
+
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval_s):
+            try:
+                _update_eval_heartbeat(
+                    hb,
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=eval_cfg,
+                    seed=seed,
+                    step=step,
+                )
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop, thread
+
+
 def _update_eval_heartbeat(
     hb: Optional[HeartbeatReporter],
     *,
@@ -380,6 +424,8 @@ def _update_eval_heartbeat(
     pdb_names: list[str],
     eval_cfg,
     seed: int,
+    step: Optional[str] = None,
+    metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     if hb is None:
         return
@@ -405,7 +451,7 @@ def _update_eval_heartbeat(
 
     def _count_af2_done(monomer: bool) -> int:
         if not (eval_monomer if monomer else eval_complex):
-            return owned_total
+            return 0
         done = 0
         for name in owned_names:
             ok = True
@@ -419,7 +465,7 @@ def _update_eval_heartbeat(
 
     def _count_ptx_done(ptx_root: str, enabled: bool) -> int:
         if not enabled:
-            return owned_total
+            return 0
         done = 0
         for name in owned_names:
             ok = True
@@ -439,43 +485,57 @@ def _update_eval_heartbeat(
         "num_seqs": num_seqs,
         "model_ids": model_ids,
     }
+
+    def _tool_entry(enabled: bool, done: int) -> dict[str, Any]:
+        if not enabled:
+            return {"enabled": False, "done": 0, "total": 0}
+        return {"enabled": True, "done": int(done), "total": int(owned_total)}
+
     tool_progress = {
-        "af2_complex": {
-            "enabled": eval_complex,
-            "done": _count_af2_done(monomer=False),
-            "total": owned_total,
-        },
-        "af2_monomer": {
-            "enabled": eval_monomer,
-            "done": _count_af2_done(monomer=True),
-            "total": owned_total,
-        },
-        "ptx_mini": {
-            "enabled": eval_ptx_mini,
-            "done": _count_ptx_done(ptx_mini_dir, eval_ptx_mini),
-            "total": owned_total,
-        },
-        "ptx": {
-            "enabled": eval_ptx,
-            "done": _count_ptx_done(ptx_dir, eval_ptx),
-            "total": owned_total,
-        },
+        "af2_complex": _tool_entry(eval_complex, _count_af2_done(monomer=False)),
+        "af2_monomer": _tool_entry(eval_monomer, _count_af2_done(monomer=True)),
+        "ptx_mini": _tool_entry(
+            eval_ptx_mini, _count_ptx_done(ptx_mini_dir, eval_ptx_mini)
+        ),
+        "ptx": _tool_entry(eval_ptx, _count_ptx_done(ptx_dir, eval_ptx)),
     }
+
+    active_tool = next(
+        (
+            tool
+            for tool in EVAL_TOOL_ORDER
+            if bool(tool_progress[tool].get("enabled"))
+            and int(tool_progress[tool].get("done", 0) or 0)
+            < int(tool_progress[tool].get("total", 0) or 0)
+        ),
+        None,
+    )
+    active_group = EVAL_TOOL_GROUP.get(active_tool) if active_tool else None
+    eval_extra: Dict[str, Any] = {
+        "task": task_name,
+        "owned_total": owned_total,
+        "owned_done": owned_done,
+        "owned_pending": int(len(pending_owned)),
+        "global_total": int(len(pdb_names)),
+        "expected_outputs": expected_outputs,
+        "tool_progress": tool_progress,
+        "active_tool": active_tool,
+        "active_group": active_group,
+    }
+    if step:
+        eval_extra["step"] = str(step)
+    if active_tool:
+        active_entry = tool_progress[active_tool]
+        eval_extra["active_done"] = int(active_entry.get("done", 0) or 0)
+        eval_extra["active_total"] = int(active_entry.get("total", 0) or 0)
+    if metrics:
+        eval_extra["metrics"] = metrics
+
     hb.update(
         produced_total=owned_done,
         expected_total=owned_total,
         primary_counter="eval_designs",
-        extra={
-            "eval": {
-                "task": task_name,
-                "owned_total": owned_total,
-                "owned_done": owned_done,
-                "owned_pending": int(len(pending_owned)),
-                "global_total": int(len(pdb_names)),
-                "expected_outputs": expected_outputs,
-                "tool_progress": tool_progress,
-            }
-        },
+        extra={"eval": eval_extra},
         force=True,
     )
 
@@ -3065,26 +3125,28 @@ def main(argv=None):
                     chain_payload=authoritative_chain_payload,
                 )
                 if hb is not None:
-                    hb.touch(
-                        extra={
-                            "eval_metrics": {
-                                "task": task_name,
-                                "chain_probe_mode": authoritative_chain_payload.get(
-                                    "chain_probe_mode"
-                                ),
-                                "chain_probe_primary_sample": authoritative_chain_payload.get(
-                                    "chain_probe_primary_sample"
-                                ),
-                                "chain_probe_sanity_sample": authoritative_chain_payload.get(
-                                    "chain_probe_sanity_sample"
-                                ),
-                                "chain_probe_sanity_status": authoritative_chain_payload.get(
-                                    "chain_probe_sanity_status"
-                                ),
-                            }
+                    _update_eval_heartbeat(
+                        hb,
+                        task_name=task_name,
+                        task_eval_dir=task_eval_dir,
+                        pdb_names=pdb_names,
+                        eval_cfg=configs.eval.binder,
+                        seed=run_seed,
+                        step="chain_probe",
+                        metrics={
+                            "chain_probe_mode": authoritative_chain_payload.get(
+                                "chain_probe_mode"
+                            ),
+                            "chain_probe_primary_sample": authoritative_chain_payload.get(
+                                "chain_probe_primary_sample"
+                            ),
+                            "chain_probe_sanity_sample": authoritative_chain_payload.get(
+                                "chain_probe_sanity_sample"
+                            ),
+                            "chain_probe_sanity_status": authoritative_chain_payload.get(
+                                "chain_probe_sanity_status"
+                            ),
                         },
-                        primary_counter="eval_designs",
-                        force=True,
                     )
 
             chain_authority_obj = _wait_for_chain_authority(
@@ -3124,22 +3186,24 @@ def main(argv=None):
                 poll_s=stagein_poll,
             )
             if hb is not None:
-                hb.touch(
-                    extra={
-                        "eval_metrics": {
-                            "task": task_name,
-                            "rank": int(DIST_WRAPPER.rank),
-                            "pdb_cache_mode": rank_cache_stats.get("pdb_cache_mode"),
-                            "pdb_reused_count": int(
-                                rank_cache_stats.get("pdb_reused_count", 0)
-                            ),
-                            "pdb_converted_count": int(
-                                rank_cache_stats.get("pdb_converted_count", 0)
-                            ),
-                        }
+                _update_eval_heartbeat(
+                    hb,
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
+                    step="pdb_cache",
+                    metrics={
+                        "rank": int(DIST_WRAPPER.rank),
+                        "pdb_cache_mode": rank_cache_stats.get("pdb_cache_mode"),
+                        "pdb_reused_count": int(
+                            rank_cache_stats.get("pdb_reused_count", 0)
+                        ),
+                        "pdb_converted_count": int(
+                            rank_cache_stats.get("pdb_converted_count", 0)
+                        ),
                     },
-                    primary_counter="eval_designs",
-                    force=True,
                 )
 
             local_chain_payload = _chain_payload(local_cond_chains, local_binder_chains)
@@ -3163,6 +3227,7 @@ def main(argv=None):
                 pdb_names=pdb_names,
                 eval_cfg=configs.eval.binder,
                 seed=run_seed,
+                step="pre_run_task",
             )
 
             my_pdb_names = list(my_owned_names)
@@ -3190,10 +3255,15 @@ def main(argv=None):
                 eval_hb_interval = float(
                     os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30
                 )
-                keepalive = _start_heartbeat_keepalive(
+                keepalive = _start_eval_heartbeat_keepalive(
                     hb,
                     interval_s=eval_hb_interval,
-                    extra={"eval_step": "run_task"},
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
+                    step="run_task",
                 )
                 try:
                     run_task(
@@ -3215,14 +3285,8 @@ def main(argv=None):
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
+                    step="run_task_complete",
                 )
-
-                if DIST_WRAPPER.rank == 0 and hb is not None:
-                    hb.touch(
-                        extra={"eval_task": task_name, "eval_step": "run_task_complete"},
-                        primary_counter="eval_designs",
-                        force=True,
-                    )
 
             output_summary = _shard_output_summary(
                 int(DIST_WRAPPER.rank),
@@ -3308,28 +3372,30 @@ def main(argv=None):
                     attempt_token=attempt_token,
                 )
                 if hb is not None:
-                    hb.touch(
-                        extra={
-                            "eval_metrics": {
-                                "task": task_name,
-                                "aggregate_fallback_converted_count": int(
-                                    aggregate_source_counts.get(
-                                        "aggregate_fallback_converted_count", 0
-                                    )
-                                ),
-                                "aggregate_owner_rank_cache_count": int(
-                                    aggregate_source_counts.get("owner_rank_cache", 0)
-                                ),
-                                "aggregate_shared_cache_count": int(
-                                    aggregate_source_counts.get("shared_cache", 0)
-                                ),
-                                "aggregate_other_rank_cache_count": int(
-                                    aggregate_source_counts.get("other_rank_cache", 0)
-                                ),
-                            }
+                    _update_eval_heartbeat(
+                        hb,
+                        task_name=task_name,
+                        task_eval_dir=task_eval_dir,
+                        pdb_names=pdb_names,
+                        eval_cfg=configs.eval.binder,
+                        seed=run_seed,
+                        step="aggregate_inputs",
+                        metrics={
+                            "aggregate_fallback_converted_count": int(
+                                aggregate_source_counts.get(
+                                    "aggregate_fallback_converted_count", 0
+                                )
+                            ),
+                            "aggregate_owner_rank_cache_count": int(
+                                aggregate_source_counts.get("owner_rank_cache", 0)
+                            ),
+                            "aggregate_shared_cache_count": int(
+                                aggregate_source_counts.get("shared_cache", 0)
+                            ),
+                            "aggregate_other_rank_cache_count": int(
+                                aggregate_source_counts.get("other_rank_cache", 0)
+                            ),
                         },
-                        primary_counter="eval_designs",
-                        force=True,
                     )
 
                 if not pdb_names:
@@ -3342,16 +3408,22 @@ def main(argv=None):
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
+                    step="pre_aggregate",
                 )
 
                 os.environ["PXDESIGN_TASK_NAME"] = str(task_name)
                 eval_hb_interval = float(
                     os.environ.get("PXDESIGN_EVAL_HEARTBEAT_INTERVAL", "30") or 30
                 )
-                keepalive = _start_heartbeat_keepalive(
+                keepalive = _start_eval_heartbeat_keepalive(
                     hb,
                     interval_s=eval_hb_interval,
-                    extra={"eval_step": "aggregate"},
+                    task_name=task_name,
+                    task_eval_dir=task_eval_dir,
+                    pdb_names=pdb_names,
+                    eval_cfg=configs.eval.binder,
+                    seed=run_seed,
+                    step="aggregate",
                 )
                 aggregate_cond_chains = _chain_ids_for_hint_compare(
                     chain_payload.get("cond_chains", [])
@@ -3382,6 +3454,7 @@ def main(argv=None):
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
+                    step="aggregate_complete",
                 )
 
                 csv_path = os.path.join(task_eval_dir, "sample_level_output.csv")

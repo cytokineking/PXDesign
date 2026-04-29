@@ -53,6 +53,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Cache for HeartbeatReporter.from_env()
 _HB_CACHE: dict[tuple[str, int], "HeartbeatReporter"] = {}
+_EVAL_TOOL_ORDER = ("af2_complex", "af2_monomer", "ptx_mini", "ptx")
+_EVAL_TOOL_GROUP = {
+    "af2_complex": "af2_eval",
+    "af2_monomer": "af2_eval",
+    "ptx_mini": "protenix_eval",
+    "ptx": "protenix_eval",
+}
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -76,6 +83,100 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
         tmp.replace(path)
     except Exception:
         pass
+
+
+def _to_nonnegative_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        n = int(value)
+    except Exception:
+        return 0
+    return max(n, 0)
+
+
+def _extract_eval_extra(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw_extra = payload.get("extra")
+    if not isinstance(raw_extra, dict):
+        return None
+    raw_eval = raw_extra.get("eval")
+    return raw_eval if isinstance(raw_eval, dict) else None
+
+
+def _aggregate_eval_extra(
+    rank_eval: List[Tuple[int, Dict[str, Any]]],
+    *,
+    produced_sum: int,
+    expected_sum: int,
+) -> Optional[Dict[str, Any]]:
+    if not rank_eval:
+        return None
+
+    saw_tool_progress = False
+    tool_progress: Dict[str, Dict[str, Any]] = {}
+    for tool_name in _EVAL_TOOL_ORDER:
+        enabled = False
+        done_sum = 0
+        total_sum = 0
+        saw_tool = False
+        for _, eval_extra in rank_eval:
+            raw_tools = eval_extra.get("tool_progress")
+            if not isinstance(raw_tools, dict):
+                continue
+            raw_entry = raw_tools.get(tool_name)
+            if not isinstance(raw_entry, dict):
+                continue
+            saw_tool = True
+            if bool(raw_entry.get("enabled", True)):
+                enabled = True
+                done_sum += _to_nonnegative_int(raw_entry.get("done"))
+                total_sum += _to_nonnegative_int(raw_entry.get("total"))
+
+        saw_tool_progress = saw_tool_progress or saw_tool
+        if enabled:
+            tool_progress[tool_name] = {
+                "enabled": True,
+                "done": done_sum,
+                "total": total_sum,
+            }
+        else:
+            tool_progress[tool_name] = {"enabled": False, "done": 0, "total": 0}
+
+    if not saw_tool_progress:
+        return None
+
+    active_tool = next(
+        (
+            tool_name
+            for tool_name in _EVAL_TOOL_ORDER
+            if bool(tool_progress[tool_name].get("enabled"))
+            and _to_nonnegative_int(tool_progress[tool_name].get("done"))
+            < _to_nonnegative_int(tool_progress[tool_name].get("total"))
+        ),
+        None,
+    )
+    active_group = _EVAL_TOOL_GROUP.get(active_tool) if active_tool else None
+    rank0_eval = next(
+        (extra for rank, extra in rank_eval if rank == 0),
+        rank_eval[0][1],
+    )
+
+    merged: Dict[str, Any] = {
+        "tool_progress": tool_progress,
+        "active_tool": active_tool,
+        "active_group": active_group,
+        "eval_done": _to_nonnegative_int(produced_sum),
+        "eval_total": _to_nonnegative_int(expected_sum),
+    }
+    for key in ("task", "step"):
+        value = rank0_eval.get(key)
+        if isinstance(value, str) and value:
+            merged[key] = value
+    if active_tool:
+        active_entry = tool_progress[active_tool]
+        merged["active_done"] = _to_nonnegative_int(active_entry.get("done"))
+        merged["active_total"] = _to_nonnegative_int(active_entry.get("total"))
+    return merged
 
 
 def _get_dist_info() -> Dict[str, int]:
@@ -308,6 +409,7 @@ class HeartbeatReporter:
     # ----------------------------
     def _aggregate(self, *, now: float) -> Dict[str, Any]:
         per_rank: List[Dict[str, Any]] = []
+        rank_eval: List[Tuple[int, Dict[str, Any]]] = []
         produced_sum = 0
         expected_sum = 0
 
@@ -320,6 +422,9 @@ class HeartbeatReporter:
                 expected = int(prog.get("expected_total", 0) or 0)
                 produced_sum += max(produced, 0)
                 expected_sum += max(expected, 0)
+                eval_extra = _extract_eval_extra(d)
+                if eval_extra is not None:
+                    rank_eval.append((r, eval_extra))
                 per_rank.append(
                     {
                         "rank": r,
@@ -347,11 +452,31 @@ class HeartbeatReporter:
 
         # Keep rank 0 stage/task as the global "label" (best-effort)
         stage = os.environ.get("PXDESIGN_STAGE", "") or None
+        if stage is None:
+            stage = next(
+                (
+                    r.get("stage")
+                    for r in per_rank
+                    if r.get("rank") == 0 and r.get("stage")
+                ),
+                None,
+            )
+            if stage is None:
+                stage = next((r.get("stage") for r in per_rank if r.get("stage")), None)
         task_name = os.environ.get("PXDESIGN_TASK_NAME", "") or None
+        if task_name is None:
+            task_name = next(
+                (
+                    r.get("task_name")
+                    for r in per_rank
+                    if r.get("rank") == 0 and r.get("task_name")
+                ),
+                None,
+            )
         seed = os.environ.get("PXDESIGN_SEED", "") or None
         global_run = os.environ.get("PXDESIGN_GLOBAL_RUN", "") or None
 
-        return {
+        payload: Dict[str, Any] = {
             "job": {
                 "output_dir": str(self.output_dir.resolve()),
                 "pid": os.getpid(),
@@ -384,3 +509,12 @@ class HeartbeatReporter:
                 "per_rank": per_rank,
             },
         }
+        if stage == "evaluation":
+            eval_extra = _aggregate_eval_extra(
+                rank_eval,
+                produced_sum=produced_sum,
+                expected_sum=expected_sum,
+            )
+            if eval_extra is not None:
+                payload["extra"] = {"eval": eval_extra}
+        return payload
