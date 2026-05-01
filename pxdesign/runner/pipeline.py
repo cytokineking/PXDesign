@@ -188,6 +188,147 @@ def _ensure_writable_dir(path: str) -> None:
         raise
 
 
+def _overlay_to_rw_path(path: str) -> Optional[str]:
+    if not path:
+        return None
+    norm = os.path.normpath(str(path))
+    root = os.path.normpath("/root/pxdesign-work")
+    if norm == root or not norm.startswith(root + os.sep):
+        return None
+    rel = norm[len(root) + 1 :]
+    parts = [part for part in rel.split(os.sep) if part]
+    if not parts:
+        return None
+    project = parts[0]
+    if project.startswith("_rw_"):
+        return norm
+    return os.path.join(root, f"_rw_{project}", *parts[1:])
+
+
+def _rw_project_root_for_path(path: str) -> Optional[str]:
+    rw_path = _overlay_to_rw_path(path)
+    if not rw_path:
+        return None
+    root = os.path.normpath("/root/pxdesign-work")
+    rel = rw_path[len(root) + 1 :]
+    parts = [part for part in rel.split(os.sep) if part]
+    if not parts:
+        return None
+    return os.path.join(root, parts[0])
+
+
+def _aggregation_seed_marker_matches(path: str, *, run_dir: str, task_name: str) -> bool:
+    rw_root = _rw_project_root_for_path(path)
+    if not rw_root:
+        return False
+    marker_path = os.path.join(rw_root, "output", ".aggregation_seed", "complete.json")
+    data = _read_json_obj(marker_path)
+    if not isinstance(data, dict):
+        return False
+    try:
+        if int(data.get("version") or 0) < 1:
+            return False
+    except Exception:
+        return False
+    if str(data.get("run_dir") or "") != str(run_dir):
+        return False
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    if str(task_name) not in {str(task) for task in tasks}:
+        return False
+    return bool(data.get("validated", True))
+
+
+def _count_local_files(path: str, pattern: str, *, recursive: bool = False) -> int:
+    try:
+        base = Path(path)
+        if not base.is_dir():
+            return 0
+        iterator = base.rglob(pattern) if recursive else base.glob(pattern)
+        return sum(1 for fp in iterator if fp.is_file() and fp.stat().st_size > 0)
+    except Exception:
+        return 0
+
+
+def _local_struct_dir_has_expected_outputs(struct_dir: str, pdb_names: list[str]) -> bool:
+    if not struct_dir or not pdb_names or not os.path.isdir(struct_dir):
+        return False
+    for name in pdb_names:
+        if not _is_nonempty_file(os.path.join(struct_dir, f"{name}.cif")):
+            return False
+    return True
+
+
+def _local_pdb_cache_has_expected_outputs(pdb_dir: str, pdb_names: list[str]) -> bool:
+    if not pdb_dir or not pdb_names or not os.path.isdir(pdb_dir):
+        return False
+    for name in pdb_names:
+        if not _is_valid_cached_pdb(os.path.join(pdb_dir, f"{name}.pdb")):
+            return False
+    return True
+
+
+def _local_eval_dir_has_expected_outputs(
+    eval_dir: str,
+    pdb_names: list[str],
+    eval_cfg,
+    seed: int,
+) -> bool:
+    if not eval_dir or not pdb_names or not os.path.isdir(eval_dir):
+        return False
+    if (
+        _count_local_files(
+            os.path.join(eval_dir, "attempts"),
+            "shard_*_inputs.json",
+            recursive=True,
+        )
+        <= 0
+    ):
+        return False
+    num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
+    expected_name_seq = int(len(pdb_names) * max(num_seqs, 1))
+    if _count_local_files(os.path.join(eval_dir, "seqs"), "*.txt") < expected_name_seq:
+        return False
+    if _pending_pdb_names(pdb_names, eval_dir, eval_cfg, seed):
+        return False
+    if bool(getattr(eval_cfg, "eval_protenix", False)):
+        ptx_pdb_count = _count_local_files(
+            os.path.join(eval_dir, "ptx_pred"), "*.pdb", recursive=True
+        )
+        if ptx_pdb_count < expected_name_seq:
+            return False
+    if bool(getattr(eval_cfg, "eval_protenix_mini", False)):
+        ptx_mini_pdb_count = _count_local_files(
+            os.path.join(eval_dir, "ptx_mini_pred"), "*.pdb", recursive=True
+        )
+        if ptx_mini_pdb_count < expected_name_seq:
+            return False
+    return True
+
+
+def _select_rw_overlay_path(
+    path: str,
+    *,
+    run_dir: str,
+    task_name: str,
+    evidence_ok: bool = False,
+) -> tuple[str, str]:
+    rw_path = _overlay_to_rw_path(path)
+    if not rw_path:
+        return path, "non_overlay"
+    if os.path.normpath(rw_path) == os.path.normpath(str(path)):
+        return path, "rw"
+    if (
+        _aggregation_seed_marker_matches(path, run_dir=run_dir, task_name=task_name)
+        and os.path.exists(rw_path)
+    ):
+        return rw_path, "marker"
+    if evidence_ok and os.path.exists(rw_path):
+        return rw_path, "evidence"
+    return path, "fallback"
+
+
 def _iter_exception_chain(exc: BaseException):
     seen: set[int] = set()
     cur: BaseException | None = exc
@@ -2780,12 +2921,6 @@ def main(argv=None):
         # Evaluation (all ranks)
         # --------------------
         os.environ["PXDESIGN_STAGE"] = "evaluation"
-        hb = HeartbeatReporter.from_env()
-        if hb is not None:
-            hb.touch(
-                extra={"stage_transition": "evaluation", "run_id": int(run_id)},
-                force=True,
-            )
 
         eval_root = os.path.join(run_dir, "eval")
         os.makedirs(eval_root, exist_ok=True)
@@ -3339,6 +3474,31 @@ def main(argv=None):
                 owned_names_by_rank = {int(k): v for k, v in (meta["owned_names_by_rank"] or {}).items()}
                 chain_payload = meta["chain_payload"]
                 diffusion_count = meta["diffusion_count"]
+                run_rel_dir = f"runs/run_{int(run_id):03d}"
+                rw_task_eval_dir = _overlay_to_rw_path(task_eval_dir) or ""
+                rw_struct_dir = _overlay_to_rw_path(struct_dir) or ""
+                eval_evidence_ok = _local_eval_dir_has_expected_outputs(
+                    rw_task_eval_dir,
+                    pdb_names,
+                    configs.eval.binder,
+                    run_seed,
+                )
+                struct_evidence_ok = _local_struct_dir_has_expected_outputs(
+                    rw_struct_dir,
+                    pdb_names,
+                )
+                aggregate_task_eval_dir, eval_source_reason = _select_rw_overlay_path(
+                    task_eval_dir,
+                    run_dir=run_rel_dir,
+                    task_name=task_name,
+                    evidence_ok=eval_evidence_ok,
+                )
+                aggregate_struct_dir, struct_source_reason = _select_rw_overlay_path(
+                    struct_dir,
+                    run_dir=run_rel_dir,
+                    task_name=task_name,
+                    evidence_ok=struct_evidence_ok,
+                )
                 agg_timeout = _clamp_env_int(
                     "PXDESIGN_AGG_READY_TIMEOUT_S", 1800, 60, 21600
                 )
@@ -3347,7 +3507,7 @@ def main(argv=None):
                 )
 
                 ready_manifests = _wait_for_shards_ready(
-                    task_eval_dir=task_eval_dir,
+                    task_eval_dir=aggregate_task_eval_dir,
                     task_name=task_name,
                     attempt_token=attempt_token,
                     pending_names_digest=pending_names_digest,
@@ -3360,7 +3520,7 @@ def main(argv=None):
                 )
 
                 aggregate_pdb_dir, aggregate_source_counts = _build_aggregate_inputs(
-                    task_eval_dir=task_eval_dir,
+                    task_eval_dir=aggregate_task_eval_dir,
                     task_name=task_name,
                     run_id=run_id,
                     run_seed=run_seed,
@@ -3368,14 +3528,37 @@ def main(argv=None):
                     all_pdb_names=pdb_names,
                     all_output_manifests=ready_manifests,
                     chain_payload=chain_payload,
-                    struct_dir=struct_dir,
+                    struct_dir=aggregate_struct_dir,
                     attempt_token=attempt_token,
+                )
+                rw_aggregate_pdb_dir = _overlay_to_rw_path(aggregate_pdb_dir) or ""
+                pdb_evidence_ok = _local_pdb_cache_has_expected_outputs(
+                    rw_aggregate_pdb_dir,
+                    pdb_names,
+                )
+                aggregate_pdb_dir, pdb_source_reason = _select_rw_overlay_path(
+                    aggregate_pdb_dir,
+                    run_dir=run_rel_dir,
+                    task_name=task_name,
+                    evidence_ok=pdb_evidence_ok,
+                )
+                logger.info(
+                    "[pipeline] aggregate path selection task=%s eval_dir=%s "
+                    "struct_dir=%s pdb_dir=%s eval_source=%s struct_source=%s "
+                    "pdb_source=%s",
+                    task_name,
+                    aggregate_task_eval_dir,
+                    aggregate_struct_dir,
+                    aggregate_pdb_dir,
+                    eval_source_reason,
+                    struct_source_reason,
+                    pdb_source_reason,
                 )
                 if hb is not None:
                     _update_eval_heartbeat(
                         hb,
                         task_name=task_name,
-                        task_eval_dir=task_eval_dir,
+                        task_eval_dir=aggregate_task_eval_dir,
                         pdb_names=pdb_names,
                         eval_cfg=configs.eval.binder,
                         seed=run_seed,
@@ -3404,7 +3587,7 @@ def main(argv=None):
                 _update_eval_heartbeat(
                     hb,
                     task_name=task_name,
-                    task_eval_dir=task_eval_dir,
+                    task_eval_dir=aggregate_task_eval_dir,
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
@@ -3419,7 +3602,7 @@ def main(argv=None):
                     hb,
                     interval_s=eval_hb_interval,
                     task_name=task_name,
-                    task_eval_dir=task_eval_dir,
+                    task_eval_dir=aggregate_task_eval_dir,
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
@@ -3433,7 +3616,7 @@ def main(argv=None):
                 )
                 aggregate_binder_eval(
                     task_name=task_name,
-                    eval_dir=task_eval_dir,
+                    eval_dir=aggregate_task_eval_dir,
                     pdb_dir=aggregate_pdb_dir,
                     pdb_names=pdb_names,
                     cond_chains=aggregate_cond_chains,
@@ -3450,14 +3633,17 @@ def main(argv=None):
                 _update_eval_heartbeat(
                     hb,
                     task_name=task_name,
-                    task_eval_dir=task_eval_dir,
+                    task_eval_dir=aggregate_task_eval_dir,
                     pdb_names=pdb_names,
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="aggregate_complete",
                 )
 
-                csv_path = os.path.join(task_eval_dir, "sample_level_output.csv")
+                csv_path = os.path.join(
+                    aggregate_task_eval_dir,
+                    "sample_level_output.csv",
+                )
                 run_success = _count_success_from_csv(csv_path)
                 cumulative_success[task_name] = cumulative_success.get(task_name, 0) + int(run_success)
 

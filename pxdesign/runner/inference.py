@@ -371,6 +371,23 @@ class InferenceRunner(object):
                 os.environ["PXDESIGN_EXPECTED_SAMPLES"] = str(int(owned_total))
                 os.environ["PXDESIGN_COMPLETED_BASE"] = str(int(owned_done))
 
+                if hb is not None:
+                    hb.update(
+                        produced_total=int(owned_done),
+                        expected_total=int(owned_total),
+                        primary_counter="diffusion_samples",
+                        extra={
+                            "diffusion": {
+                                "resume_scan": True,
+                                "global_done": int(len(done_all)),
+                                "global_total": int(expected_total),
+                                "rank_owned_done": int(owned_done),
+                                "rank_owned_total": int(owned_total),
+                            }
+                        },
+                        force=True,
+                    )
+
                 if not my_missing:
                     logger.info(
                         f"[Rank {rank}] {sample}: "

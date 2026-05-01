@@ -45,6 +45,7 @@ Metadata env vars (optional, set by runner):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import time
@@ -53,12 +54,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Cache for HeartbeatReporter.from_env()
 _HB_CACHE: dict[tuple[str, int], "HeartbeatReporter"] = {}
+logger = logging.getLogger(__name__)
 _EVAL_TOOL_ORDER = ("af2_complex", "af2_monomer", "ptx_mini", "ptx")
 _EVAL_TOOL_GROUP = {
     "af2_complex": "af2_eval",
     "af2_monomer": "af2_eval",
     "ptx_mini": "protenix_eval",
     "ptx": "protenix_eval",
+}
+_STAGE_RANK = {
+    "startup": 0,
+    "diffusion": 1,
+    "evaluation": 2,
+    "ranking": 3,
+    "completed": 4,
 }
 
 
@@ -85,6 +94,14 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
         pass
 
 
+def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _to_nonnegative_int(value: Any) -> int:
     try:
         if isinstance(value, bool):
@@ -101,6 +118,99 @@ def _extract_eval_extra(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     raw_eval = raw_extra.get("eval")
     return raw_eval if isinstance(raw_eval, dict) else None
+
+
+def _has_eval_tool_progress(payload: Dict[str, Any]) -> bool:
+    eval_extra = _extract_eval_extra(payload)
+    if not isinstance(eval_extra, dict):
+        return False
+    tools = eval_extra.get("tool_progress")
+    return isinstance(tools, dict) and bool(tools)
+
+
+def _pipeline_value(payload: Dict[str, Any], key: str) -> Any:
+    raw_pipeline = payload.get("pipeline")
+    if not isinstance(raw_pipeline, dict):
+        return None
+    return raw_pipeline.get(key)
+
+
+def _progress_value(payload: Dict[str, Any], key: str) -> Any:
+    raw_progress = payload.get("progress")
+    if not isinstance(raw_progress, dict):
+        return None
+    return raw_progress.get(key)
+
+
+def _stage_rank(stage: Any) -> Optional[int]:
+    if stage is None:
+        return None
+    return _STAGE_RANK.get(str(stage))
+
+
+def _same_logical_run(existing: Dict[str, Any], new: Dict[str, Any]) -> bool:
+    saw_shared_identity = False
+    for key in ("global_run", "seed", "task_name"):
+        old_value = _pipeline_value(existing, key)
+        new_value = _pipeline_value(new, key)
+        if old_value in (None, "") or new_value in (None, ""):
+            continue
+        saw_shared_identity = True
+        if str(old_value) != str(new_value):
+            return False
+    return saw_shared_identity
+
+
+def _heartbeat_rejection_reason(
+    existing: Optional[Dict[str, Any]], new: Dict[str, Any]
+) -> Optional[str]:
+    new_stage = _pipeline_value(new, "stage")
+    new_counter = _progress_value(new, "primary_counter")
+    if new_stage == "evaluation" and new_counter == "diffusion_samples":
+        return "incoherent evaluation heartbeat uses diffusion_samples counter"
+
+    if not isinstance(existing, dict) or not _same_logical_run(existing, new):
+        return None
+
+    old_stage = _pipeline_value(existing, "stage")
+    old_rank = _stage_rank(old_stage)
+    new_rank = _stage_rank(new_stage)
+    if old_rank is not None and new_rank is not None and new_rank < old_rank:
+        return f"stage regression from {old_stage} to {new_stage}"
+
+    old_counter = _progress_value(existing, "primary_counter")
+    if old_stage == new_stage and old_counter == new_counter and old_counter:
+        old_produced = _to_nonnegative_int(_progress_value(existing, "produced_total"))
+        new_produced = _to_nonnegative_int(_progress_value(new, "produced_total"))
+        if new_produced < old_produced:
+            return (
+                f"counter regression for {new_stage}/{new_counter}: "
+                f"{old_produced} -> {new_produced}"
+            )
+
+    if (
+        old_stage == "evaluation"
+        and new_stage == "evaluation"
+        and _has_eval_tool_progress(existing)
+        and not _has_eval_tool_progress(new)
+    ):
+        return "weak evaluation heartbeat would erase eval.tool_progress"
+
+    return None
+
+
+def _should_preserve_existing_aggregate(
+    existing: Optional[Dict[str, Any]], new: Dict[str, Any]
+) -> bool:
+    if not isinstance(existing, dict):
+        return False
+    if _pipeline_value(new, "stage") != "evaluation":
+        return False
+    if _pipeline_value(existing, "stage") != "evaluation":
+        return False
+    if not _same_logical_run(existing, new):
+        return False
+    return _has_eval_tool_progress(existing) and not _has_eval_tool_progress(new)
 
 
 def _aggregate_eval_extra(
@@ -172,6 +282,9 @@ def _aggregate_eval_extra(
         value = rank0_eval.get(key)
         if isinstance(value, str) and value:
             merged[key] = value
+    expected_outputs = rank0_eval.get("expected_outputs")
+    if isinstance(expected_outputs, dict):
+        merged["expected_outputs"] = expected_outputs
     if active_tool:
         active_entry = tool_progress[active_tool]
         merged["active_done"] = _to_nonnegative_int(active_entry.get("done"))
@@ -284,6 +397,14 @@ class HeartbeatReporter:
         if not force and (now - self._last_write_ts) < self.interval_seconds:
             return
 
+        previous_state = (
+            self._expected_total,
+            self._produced_total,
+            list(self._recent),
+            self._state,
+            self._primary_counter,
+        )
+
         self._produced_total = max(int(produced_total), 0)
         if expected_total is not None:
             self._expected_total = max(int(expected_total), 0)
@@ -304,11 +425,12 @@ class HeartbeatReporter:
         else:
             rate_per_sec = 0.0
 
-        expected = max(int(self._expected_total or 0), 1)
+        expected_total = max(int(self._expected_total or 0), 0)
+        expected_for_percent = max(expected_total, 1)
         produced = max(int(self._produced_total), 0)
-        percent = min(max(produced / expected, 0.0), 1.0)
+        percent = min(max(produced / expected_for_percent, 0.0), 1.0)
 
-        remaining = max(expected - produced, 0)
+        remaining = max(expected_total - produced, 0)
         eta_seconds: Optional[float] = None
         if state == "completed":
             percent = 1.0
@@ -357,7 +479,7 @@ class HeartbeatReporter:
                 "world_size": self.world_size,
             },
             "progress": {
-                "expected_total": expected,
+                "expected_total": expected_total,
                 "produced_total": produced,
                 "throughput_per_min": rate_per_sec * 60.0,
                 "throughput_window_sec": self.throughput_window_seconds,
@@ -368,12 +490,42 @@ class HeartbeatReporter:
         if extra:
             payload["extra"] = extra
 
+        existing_rank = _read_json_dict(self._rank_path())
+        rejection_reason = _heartbeat_rejection_reason(existing_rank, payload)
+        if rejection_reason:
+            (
+                self._expected_total,
+                self._produced_total,
+                self._recent,
+                self._state,
+                self._primary_counter,
+            ) = previous_state
+            logger.warning(
+                "Skipping heartbeat write: reason=%s old_stage=%s new_stage=%s "
+                "old_counter=%s new_counter=%s old_produced=%s new_produced=%s",
+                rejection_reason,
+                _pipeline_value(existing_rank or {}, "stage"),
+                _pipeline_value(payload, "stage"),
+                _progress_value(existing_rank or {}, "primary_counter"),
+                _progress_value(payload, "primary_counter"),
+                _progress_value(existing_rank or {}, "produced_total"),
+                _progress_value(payload, "produced_total"),
+            )
+            return
+
         _atomic_write_json(self._rank_path(), payload)
 
         # Aggregate on rank 0
         if self.rank == 0:
             agg = self._aggregate(now=now)
-            _atomic_write_json(self._global_path(), agg)
+            existing_global = _read_json_dict(self._global_path())
+            if _should_preserve_existing_aggregate(existing_global, agg):
+                logger.warning(
+                    "Preserving existing aggregate heartbeat with eval.tool_progress; "
+                    "new aggregate lacks eval metadata"
+                )
+            else:
+                _atomic_write_json(self._global_path(), agg)
 
         self._last_write_ts = now
 
