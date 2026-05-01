@@ -272,6 +272,46 @@ def test_eval_tool_progress_aggregate_is_preserved(tmp_path, monkeypatch):
     }
 
 
+def test_diffusion_resume_aggregate_does_not_replace_eval_status(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PXDESIGN_STAGE", "diffusion")
+    monkeypatch.setenv("PXDESIGN_TASK_NAME", "task-a")
+    monkeypatch.setenv("PXDESIGN_SEED", "123")
+    monkeypatch.setenv("PXDESIGN_GLOBAL_RUN", "0")
+    hb = HeartbeatReporter(tmp_path)
+    hb.rank = 0
+    hb.world_size = 1
+
+    existing_global = _write_rank_status(
+        tmp_path,
+        99,
+        stage="evaluation",
+        produced_total=10,
+        expected_total=10,
+        primary_counter="eval_designs",
+        eval_extra=_eval_tool_progress(),
+    )
+    _write_global_status(tmp_path, existing_global)
+    (tmp_path / "status_rank99.json").unlink()
+
+    hb.update(
+        produced_total=10000,
+        expected_total=10000,
+        primary_counter="diffusion_samples",
+        force=True,
+    )
+
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["pipeline"]["stage"] == "evaluation"
+    assert status["progress"]["primary_counter"] == "eval_designs"
+    assert status["extra"]["eval"]["tool_progress"]["af2_complex"] == {
+        "enabled": True,
+        "done": 10,
+        "total": 10,
+    }
+
+
 def test_expected_total_zero_is_preserved_in_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("PXDESIGN_STAGE", "diffusion")
     monkeypatch.setenv("PXDESIGN_TASK_NAME", "task-a")

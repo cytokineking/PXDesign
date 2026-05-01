@@ -204,12 +204,16 @@ def _should_preserve_existing_aggregate(
 ) -> bool:
     if not isinstance(existing, dict):
         return False
-    if _pipeline_value(new, "stage") != "evaluation":
-        return False
-    if _pipeline_value(existing, "stage") != "evaluation":
-        return False
     if not _same_logical_run(existing, new):
         return False
+
+    old_stage = _pipeline_value(existing, "stage")
+    new_stage = _pipeline_value(new, "stage")
+    old_rank = _stage_rank(old_stage)
+    new_rank = _stage_rank(new_stage)
+    if old_rank is not None and new_rank is not None and new_rank < old_rank:
+        return True
+
     return _has_eval_tool_progress(existing) and not _has_eval_tool_progress(new)
 
 

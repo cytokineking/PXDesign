@@ -2921,6 +2921,7 @@ def main(argv=None):
         # Evaluation (all ranks)
         # --------------------
         os.environ["PXDESIGN_STAGE"] = "evaluation"
+        hb = HeartbeatReporter.from_env()
 
         eval_root = os.path.join(run_dir, "eval")
         os.makedirs(eval_root, exist_ok=True)
