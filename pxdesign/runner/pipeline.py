@@ -125,6 +125,11 @@ def _canonical_hash(values: list[str] | None) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _expected_pdb_names(task_name: str, expected_total: int) -> list[str]:
+    total = max(int(expected_total or 0), 0)
+    return [f"{task_name}_sample_{i:06d}" for i in range(total)]
+
+
 def _make_attempt_token(
     run_id: int,
     task_name: str,
@@ -217,27 +222,760 @@ def _rw_project_root_for_path(path: str) -> Optional[str]:
     return os.path.join(root, parts[0])
 
 
+def _marker_norm_key(value: Any) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _marker_int(value: Any) -> Optional[int]:
+    try:
+        if isinstance(value, bool):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _marker_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+    return None
+
+
+def _marker_task_names(data: dict) -> set[str]:
+    tasks = data.get("tasks")
+    names: set[str] = set()
+    if isinstance(tasks, dict):
+        names.update(str(k) for k in tasks.keys())
+    elif isinstance(tasks, list):
+        for item in tasks:
+            if isinstance(item, dict):
+                for key in ("task", "task_name", "name"):
+                    value = item.get(key)
+                    if value:
+                        names.add(str(value))
+                        break
+            elif item is not None:
+                names.add(str(item))
+    elif tasks:
+        names.add(str(tasks))
+    return names
+
+
+def _marker_task_payloads(data: dict, task_name: str) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for key in (
+        "tasks",
+        "task_counts",
+        "task_status",
+        "task_metadata",
+        "tasks_by_name",
+        "per_task",
+        "by_task",
+    ):
+        value = data.get(key)
+        if isinstance(value, dict):
+            item = value.get(task_name)
+            if item is None:
+                item = value.get(str(task_name))
+            if isinstance(item, dict):
+                payloads.append(item)
+        elif isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                item_name = item.get("task") or item.get("task_name") or item.get("name")
+                if str(item_name or "") == str(task_name):
+                    payloads.append(item)
+    return payloads
+
+
+def _marker_sections(
+    data: dict,
+    task_name: str,
+    section_names: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    roots = [data] + _marker_task_payloads(data, task_name)
+    sections: list[dict[str, Any]] = []
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        for key in section_names:
+            value = root.get(key)
+            if isinstance(value, dict):
+                sections.append(value)
+                task_value = value.get(task_name) or value.get(str(task_name))
+                if isinstance(task_value, dict):
+                    sections.append(task_value)
+        sections.append(root)
+    return sections
+
+
+def _marker_first_value(sections: list[dict[str, Any]], aliases: tuple[str, ...]) -> Any:
+    wanted = {_marker_norm_key(alias) for alias in aliases}
+    for section in sections:
+        for key, value in section.items():
+            if _marker_norm_key(key) in wanted:
+                return value
+    return None
+
+
+def _marker_first_int(sections: list[dict[str, Any]], aliases: tuple[str, ...]) -> Optional[int]:
+    return _marker_int(_marker_first_value(sections, aliases))
+
+
+def _marker_aliases(*aliases: str) -> tuple[str, ...]:
+    expanded: list[str] = []
+    for alias in aliases:
+        expanded.extend(
+            [
+                alias,
+                f"expected_{alias}",
+                f"{alias}_expected",
+                f"{alias}_expected_count",
+                f"expected_{alias}_count",
+            ]
+        )
+    return tuple(expanded)
+
+
+def _marker_tool_name(name: Any) -> Optional[str]:
+    key = _marker_norm_key(name)
+    if key in {"af2complex", "complex", "evalcomplex", "alphafoldcomplex"}:
+        return "af2_complex"
+    if key in {
+        "af2monomer",
+        "monomer",
+        "bindermonomer",
+        "evalbindermonomer",
+        "alphafoldmonomer",
+    }:
+        return "af2_monomer"
+    if key in {"ptx", "protenix", "evalprotenix"}:
+        return "ptx"
+    if key in {"ptxmini", "protenixmini", "evalprotenixmini"}:
+        return "ptx_mini"
+    return None
+
+
+def _marker_enabled_tools(data: dict, task_name: str) -> Optional[dict[str, bool]]:
+    roots = [data] + _marker_task_payloads(data, task_name)
+    sections = _marker_sections(
+        data,
+        task_name,
+        (
+            "enabled_tools",
+            "enabled_eval_tools",
+            "eval_tools",
+            "tools_enabled",
+            "tool_enabled",
+        ),
+    )
+    sections.extend(
+        section
+        for section in _marker_sections(data, task_name, ("tools", "eval", "config"))
+        if isinstance(section, dict)
+    )
+
+    tools: dict[str, bool] = {}
+
+    def _set_tool(raw_name: Any, raw_value: Any = True) -> None:
+        canonical = _marker_tool_name(raw_name)
+        if canonical is None:
+            return
+        enabled = raw_value
+        if isinstance(raw_value, dict):
+            enabled = raw_value.get("enabled", raw_value.get("active", True))
+        as_bool = _marker_bool(enabled)
+        if as_bool is not None:
+            tools[canonical] = bool(as_bool)
+
+    for section in sections:
+        if isinstance(section, list):
+            for item in section:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("tool") or item.get("id")
+                    _set_tool(name, item.get("enabled", True))
+                else:
+                    _set_tool(item, True)
+            continue
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            if isinstance(value, dict) and _marker_norm_key(key) in {"af2", "alphafold"}:
+                for sub_key, sub_value in value.items():
+                    _set_tool(f"af2_{sub_key}", sub_value)
+                continue
+            if isinstance(value, list) and _marker_norm_key(key) in {
+                "enabledtools",
+                "enabledevaltools",
+                "evaltools",
+            }:
+                for item in value:
+                    _set_tool(item, True)
+                continue
+            _set_tool(key, value)
+
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        for key in (
+            "enabled_tools",
+            "enabled_eval_tools",
+            "eval_tools",
+            "tools_enabled",
+            "tool_enabled",
+        ):
+            value = root.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        name = item.get("name") or item.get("tool") or item.get("id")
+                        _set_tool(name, item.get("enabled", True))
+                    else:
+                        _set_tool(item, True)
+
+    return tools if tools else None
+
+
+def _eval_tool_flags(eval_cfg) -> dict[str, bool]:
+    return {
+        "af2_complex": bool(getattr(eval_cfg, "eval_complex", False)),
+        "af2_monomer": bool(getattr(eval_cfg, "eval_binder_monomer", False)),
+        "ptx_mini": bool(getattr(eval_cfg, "eval_protenix_mini", False)),
+        "ptx": bool(getattr(eval_cfg, "eval_protenix", False)),
+    }
+
+
+def _check_marker_count(
+    *,
+    status: dict[str, Any],
+    label: str,
+    expected: int,
+    expected_sections: list[dict[str, Any]],
+    count_sections: list[dict[str, Any]],
+    aliases: tuple[str, ...],
+    expected_aliases: Optional[tuple[str, ...]] = None,
+    required: bool = True,
+) -> bool:
+    expected_aliases = expected_aliases or aliases
+    marker_expected = _marker_first_int(
+        expected_sections,
+        _marker_aliases(*expected_aliases),
+    )
+    observed = _marker_first_int(count_sections, aliases)
+    status.setdefault("counts", {})[label] = {
+        "expected": int(expected),
+        "marker_expected": marker_expected,
+        "observed": observed,
+    }
+    if marker_expected is None:
+        if required:
+            status["reason"] = f"missing_expected_count:{label}"
+            return False
+    elif int(marker_expected) != int(expected):
+        status["reason"] = (
+            f"expected_count_mismatch:{label}:"
+            f"marker={int(marker_expected)}:config={int(expected)}"
+        )
+        return False
+    if expected <= 0:
+        return True
+    if observed is None:
+        if required:
+            status["reason"] = f"missing_observed_count:{label}"
+            return False
+        return True
+    if int(observed) < int(expected):
+        status["reason"] = (
+            f"observed_count_insufficient:{label}:"
+            f"observed={int(observed)}:expected={int(expected)}"
+        )
+        return False
+    return True
+
+
+def _marker_has_count(
+    expected_sections: list[dict[str, Any]],
+    count_sections: list[dict[str, Any]],
+    aliases: tuple[str, ...],
+) -> bool:
+    return (
+        _marker_first_int(expected_sections, _marker_aliases(*aliases)) is not None
+        or _marker_first_int(count_sections, aliases) is not None
+    )
+
+
+def _aggregation_seed_marker_status(
+    path: str,
+    *,
+    run_dir: str,
+    task_name: str,
+    eval_cfg=None,
+    expected_total: Optional[int] = None,
+    pdb_names: Optional[list[str]] = None,
+    run_seed: Optional[int] = None,
+) -> dict[str, Any]:
+    rw_root = _rw_project_root_for_path(path)
+    marker_path = (
+        os.path.join(rw_root, "output", ".aggregation_seed", "complete.json")
+        if rw_root
+        else ""
+    )
+    expected_designs = int(expected_total or 0)
+    current_pdb_digest = _canonical_hash(pdb_names or [])
+    status: dict[str, Any] = {
+        "valid": False,
+        "usable_for_completeness": False,
+        "usable_for_legacy_scan_bypass": False,
+        "usable_for_path_preference": False,
+        "mode": "none",
+        "reason": "missing_rw_root" if not rw_root else "missing_marker",
+        "marker_path": marker_path,
+        "rw_root": rw_root or "",
+        "expected_designs": expected_designs,
+        "current_pdb_names_digest": current_pdb_digest,
+        "marker_pdb_names_digest": "",
+        "counts": {},
+    }
+    if not rw_root:
+        return status
+    data = _read_json_obj(marker_path)
+    if not isinstance(data, dict):
+        return status
+
+    try:
+        version = data.get("version")
+        if version is not None and int(version) < 1:
+            status["reason"] = "unsupported_marker_version"
+            return status
+    except Exception:
+        status["reason"] = "invalid_marker_version"
+        return status
+
+    if not bool(data.get("validated", True)):
+        status["reason"] = "marker_not_validated"
+        return status
+    if str(data.get("run_dir") or "") != str(run_dir):
+        status["reason"] = (
+            f"run_dir_mismatch:marker={data.get('run_dir')}:current={run_dir}"
+        )
+        return status
+    if run_seed is not None and data.get("run_seed") is not None:
+        try:
+            if int(data.get("run_seed")) != int(run_seed):
+                status["reason"] = "run_seed_mismatch"
+                return status
+        except Exception:
+            status["reason"] = "invalid_run_seed"
+            return status
+    if str(task_name) not in _marker_task_names(data):
+        status["reason"] = "task_missing"
+        return status
+
+    status["valid"] = True
+    status["usable_for_path_preference"] = True
+    status["mode"] = "path_preference"
+    status["reason"] = "basic_valid"
+
+    if eval_cfg is None or expected_designs <= 0:
+        return status
+
+    count_sections = _marker_sections(
+        data,
+        task_name,
+        (
+            "counts",
+            "observed_counts",
+            "actual_counts",
+            "validation_counts",
+            "artifact_counts",
+            "outputs",
+        ),
+    )
+    expected_sections = _marker_sections(
+        data,
+        task_name,
+        (
+            "expected_counts",
+            "expected",
+            "expected_outputs",
+            "required_counts",
+            "requirements",
+        ),
+    )
+
+    expected_tools = _eval_tool_flags(eval_cfg)
+    marker_tools = _marker_enabled_tools(data, task_name)
+    status["expected_tools"] = dict(expected_tools)
+    status["marker_tools"] = dict(marker_tools or {})
+    if marker_tools is None:
+        status["reason"] = "missing_enabled_tools"
+        return status
+    for tool_name, enabled in expected_tools.items():
+        if bool(marker_tools.get(tool_name)) != bool(enabled):
+            status["reason"] = (
+                f"enabled_tool_mismatch:{tool_name}:"
+                f"marker={bool(marker_tools.get(tool_name))}:config={bool(enabled)}"
+            )
+            return status
+
+    num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
+    expected_name_seq = int(expected_designs * max(num_seqs, 1))
+    status["expected_name_seq"] = expected_name_seq
+
+    local_count = len(pdb_names) if pdb_names is not None else expected_designs
+    if int(local_count) < expected_designs:
+        status["reason"] = (
+            f"local_design_count_insufficient:local={int(local_count)}:"
+            f"expected={expected_designs}"
+        )
+        return status
+
+    if not _check_marker_count(
+        status=status,
+        label="diffusion_cif",
+        expected=expected_designs,
+        expected_sections=expected_sections,
+        count_sections=count_sections,
+        aliases=(
+            "diffusion_cif_count",
+            "diffusion_cif",
+            "diffusion_cifs",
+            "diffusion_count",
+            "cif_count",
+            "cif",
+            "cifs",
+            "structures",
+            "structure_cifs",
+        ),
+    ):
+        return status
+    if not _check_marker_count(
+        status=status,
+        label="seq_txt",
+        expected=expected_name_seq,
+        expected_sections=expected_sections,
+        count_sections=count_sections,
+        aliases=(
+            "sequence_txt_count",
+            "sequence_txt",
+            "seq_txt_count",
+            "seq_txt",
+            "seqs_txt_count",
+            "sequence_count",
+            "seq_count",
+            "seqs",
+        ),
+    ):
+        return status
+
+    af2_model_count = max(len(_model_ids_from_cfg(eval_cfg)), 1)
+    af2_expected = expected_name_seq * af2_model_count * int(
+        bool(expected_tools["af2_complex"]) + bool(expected_tools["af2_monomer"])
+    )
+    if af2_expected:
+        af2_json_aliases = (
+            "af2_json",
+            "af2_json_count",
+            "af2_jsons",
+            "af2_summary_json",
+            "af2_summary_json_count",
+            "alphafold_json",
+            "alphafold_json_count",
+        )
+        af2_pdb_aliases = (
+            "af2_pdb",
+            "af2_pdb_count",
+            "af2_pdbs",
+            "alphafold_pdb",
+            "alphafold_pdb_count",
+        )
+        combined_aliases = (
+            "af2_count",
+            "af2_outputs",
+            "af2_name_seq_count",
+            "alphafold_count",
+        )
+        if _marker_has_count(expected_sections, count_sections, af2_json_aliases) or _marker_has_count(
+            expected_sections, count_sections, af2_pdb_aliases
+        ):
+            if not _check_marker_count(
+                status=status,
+                label="af2_json",
+                expected=af2_expected,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=af2_json_aliases,
+                expected_aliases=af2_json_aliases + combined_aliases,
+            ):
+                return status
+            if not _check_marker_count(
+                status=status,
+                label="af2_pdb",
+                expected=af2_expected,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=af2_pdb_aliases,
+                expected_aliases=af2_pdb_aliases + combined_aliases,
+            ):
+                return status
+        elif _marker_first_int(expected_sections, _marker_aliases(*combined_aliases)) is not None:
+            if not _check_marker_count(
+                status=status,
+                label="af2_total",
+                expected=af2_expected,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=combined_aliases,
+            ):
+                return status
+        else:
+            if expected_tools["af2_complex"] and not _check_marker_count(
+                status=status,
+                label="af2_complex",
+                expected=expected_name_seq * af2_model_count,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=(
+                    "af2_complex",
+                    "af2_complex_count",
+                    "af2_complex_outputs",
+                    "af2_complex_json",
+                    "af2_complex_json_count",
+                    "af2_complex_pdb",
+                    "af2_complex_pdb_count",
+                    "complex_af2_count",
+                    "eval_complex_count",
+                ),
+            ):
+                return status
+            if expected_tools["af2_monomer"] and not _check_marker_count(
+                status=status,
+                label="af2_monomer",
+                expected=expected_name_seq * af2_model_count,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=(
+                    "af2_monomer",
+                    "af2_monomer_count",
+                    "af2_monomer_outputs",
+                    "af2_monomer_json",
+                    "af2_monomer_json_count",
+                    "af2_monomer_pdb",
+                    "af2_monomer_pdb_count",
+                    "binder_monomer_count",
+                    "eval_binder_monomer_count",
+                ),
+            ):
+                return status
+
+    if expected_tools["ptx"]:
+        ptx_json_aliases = (
+            "ptx_json",
+            "ptx_json_count",
+            "ptx_summary_json",
+            "ptx_summary_json_count",
+            "protenix_json",
+            "protenix_json_count",
+        )
+        ptx_pdb_aliases = (
+            "ptx_pdb",
+            "ptx_pdb_count",
+            "ptx_pdbs",
+            "protenix_pdb",
+            "protenix_pdb_count",
+        )
+        ptx_combined_aliases = (
+            "ptx_count",
+            "ptx_outputs",
+            "protenix_count",
+            "protenix_outputs",
+        )
+        if _marker_has_count(expected_sections, count_sections, ptx_json_aliases) or _marker_has_count(
+            expected_sections, count_sections, ptx_pdb_aliases
+        ):
+            if not _check_marker_count(
+                status=status,
+                label="ptx_json",
+                expected=expected_name_seq,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=ptx_json_aliases,
+                expected_aliases=ptx_json_aliases + ptx_combined_aliases,
+            ):
+                return status
+            if not _check_marker_count(
+                status=status,
+                label="ptx_pdb",
+                expected=expected_name_seq,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=ptx_pdb_aliases,
+                expected_aliases=ptx_pdb_aliases + ptx_combined_aliases,
+            ):
+                return status
+        elif not _check_marker_count(
+            status=status,
+            label="ptx",
+            expected=expected_name_seq,
+            expected_sections=expected_sections,
+            count_sections=count_sections,
+            aliases=ptx_combined_aliases,
+        ):
+            return status
+    if expected_tools["ptx_mini"]:
+        ptx_mini_json_aliases = (
+            "ptx_mini_json",
+            "ptx_mini_json_count",
+            "ptx_mini_summary_json",
+            "ptx_mini_summary_json_count",
+            "protenix_mini_json",
+            "protenix_mini_json_count",
+        )
+        ptx_mini_pdb_aliases = (
+            "ptx_mini_pdb",
+            "ptx_mini_pdb_count",
+            "ptx_mini_pdbs",
+            "protenix_mini_pdb",
+            "protenix_mini_pdb_count",
+        )
+        ptx_mini_combined_aliases = (
+            "ptx_mini_count",
+            "ptx_mini_outputs",
+            "protenix_mini_count",
+            "protenix_mini_outputs",
+        )
+        if _marker_has_count(
+            expected_sections, count_sections, ptx_mini_json_aliases
+        ) or _marker_has_count(expected_sections, count_sections, ptx_mini_pdb_aliases):
+            if not _check_marker_count(
+                status=status,
+                label="ptx_mini_json",
+                expected=expected_name_seq,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=ptx_mini_json_aliases,
+                expected_aliases=ptx_mini_json_aliases + ptx_mini_combined_aliases,
+            ):
+                return status
+            if not _check_marker_count(
+                status=status,
+                label="ptx_mini_pdb",
+                expected=expected_name_seq,
+                expected_sections=expected_sections,
+                count_sections=count_sections,
+                aliases=ptx_mini_pdb_aliases,
+                expected_aliases=ptx_mini_pdb_aliases + ptx_mini_combined_aliases,
+            ):
+                return status
+        elif not _check_marker_count(
+            status=status,
+            label="ptx_mini",
+            expected=expected_name_seq,
+            expected_sections=expected_sections,
+            count_sections=count_sections,
+            aliases=ptx_mini_combined_aliases,
+        ):
+            return status
+    if not expected_tools["ptx_mini"]:
+        mini_expected = _marker_first_int(
+            expected_sections,
+            _marker_aliases(
+                "ptx_mini",
+                "ptx_mini_count",
+                "ptx_mini_outputs",
+                "ptx_mini_json",
+                "ptx_mini_pdb",
+                "protenix_mini_count",
+                "protenix_mini_outputs",
+            ),
+        )
+        if mini_expected not in (None, 0):
+            status["reason"] = (
+                f"disabled_tool_expected_count_nonzero:ptx_mini:{mini_expected}"
+            )
+            return status
+
+    marker_digest = _marker_first_value(
+        expected_sections + count_sections,
+        (
+            "pdb_names_digest",
+            "pdb_name_digest",
+            "names_digest",
+            "expected_pdb_names_digest",
+        ),
+    )
+    if isinstance(marker_digest, str):
+        status["marker_pdb_names_digest"] = marker_digest
+
+    strict_ok = False
+    strict_reasons: list[str] = []
+    marker_num_seqs = _marker_first_int(
+        expected_sections + count_sections,
+        ("num_seqs", "num_sequences", "n_seq", "n_seqs"),
+    )
+    if marker_num_seqs is None or int(marker_num_seqs) != int(num_seqs):
+        strict_reasons.append("num_seqs")
+    marker_model_ids = _marker_first_value(
+        expected_sections + count_sections,
+        ("model_ids", "af2_model_ids", "af2_models"),
+    )
+    if isinstance(marker_model_ids, list):
+        try:
+            marker_model_ids_norm = sorted(int(x) for x in marker_model_ids)
+            current_model_ids = sorted(int(x) for x in _model_ids_from_cfg(eval_cfg))
+            if marker_model_ids_norm != current_model_ids:
+                strict_reasons.append("model_ids")
+        except Exception:
+            strict_reasons.append("model_ids")
+    else:
+        strict_reasons.append("model_ids")
+    if not marker_digest or str(marker_digest) != str(current_pdb_digest):
+        strict_reasons.append("pdb_names_digest")
+    if not strict_reasons:
+        strict_ok = True
+
+    if strict_ok:
+        status["usable_for_completeness"] = True
+        status["usable_for_legacy_scan_bypass"] = True
+        status["mode"] = "strict_manifest"
+        status["reason"] = "strict_manifest_complete"
+    else:
+        status["usable_for_legacy_scan_bypass"] = True
+        status["mode"] = "legacy_counts_scan_bypass"
+        status["reason"] = "legacy_counts_complete:missing_" + ",".join(
+            sorted(set(strict_reasons))
+        )
+    return status
+
+
+def _marker_allows_eval_scan_bypass(marker_status: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(marker_status, dict):
+        return False
+    return bool(
+        marker_status.get("usable_for_completeness")
+        or marker_status.get("usable_for_legacy_scan_bypass")
+    )
+
+
 def _aggregation_seed_marker_matches(path: str, *, run_dir: str, task_name: str) -> bool:
     rw_root = _rw_project_root_for_path(path)
     if not rw_root:
         return False
-    marker_path = os.path.join(rw_root, "output", ".aggregation_seed", "complete.json")
-    data = _read_json_obj(marker_path)
-    if not isinstance(data, dict):
-        return False
-    try:
-        if int(data.get("version") or 0) < 1:
-            return False
-    except Exception:
-        return False
-    if str(data.get("run_dir") or "") != str(run_dir):
-        return False
-    tasks = data.get("tasks")
-    if not isinstance(tasks, list):
-        return False
-    if str(task_name) not in {str(task) for task in tasks}:
-        return False
-    return bool(data.get("validated", True))
+    status = _aggregation_seed_marker_status(
+        path,
+        run_dir=run_dir,
+        task_name=task_name,
+    )
+    return bool(status.get("usable_for_path_preference"))
 
 
 def _count_local_files(path: str, pattern: str, *, recursive: bool = False) -> int:
@@ -313,17 +1051,23 @@ def _select_rw_overlay_path(
     run_dir: str,
     task_name: str,
     evidence_ok: bool = False,
+    marker_status: Optional[dict[str, Any]] = None,
+    allow_marker_path: bool = False,
 ) -> tuple[str, str]:
+    del run_dir, task_name
     rw_path = _overlay_to_rw_path(path)
     if not rw_path:
         return path, "non_overlay"
     if os.path.normpath(rw_path) == os.path.normpath(str(path)):
         return path, "rw"
     if (
-        _aggregation_seed_marker_matches(path, run_dir=run_dir, task_name=task_name)
+        allow_marker_path
+        and isinstance(marker_status, dict)
+        and bool(marker_status.get("usable_for_path_preference"))
         and os.path.exists(rw_path)
     ):
-        return rw_path, "marker"
+        mode = str(marker_status.get("mode") or "marker")
+        return rw_path, f"marker:{mode}"
     if evidence_ok and os.path.exists(rw_path):
         return rw_path, "evidence"
     return path, "fallback"
@@ -531,6 +1275,8 @@ def _start_eval_heartbeat_keepalive(
     eval_cfg,
     seed: int,
     step: str,
+    scan_complete: bool = False,
+    marker_status: Optional[Dict[str, Any]] = None,
 ) -> Optional[tuple[threading.Event, threading.Thread]]:
     if hb is None or interval_s <= 0:
         return None
@@ -548,6 +1294,8 @@ def _start_eval_heartbeat_keepalive(
                     eval_cfg=eval_cfg,
                     seed=seed,
                     step=step,
+                    scan_complete=scan_complete,
+                    marker_status=marker_status,
                 )
             except Exception:
                 pass
@@ -567,6 +1315,8 @@ def _update_eval_heartbeat(
     seed: int,
     step: Optional[str] = None,
     metrics: Optional[Dict[str, Any]] = None,
+    scan_complete: bool = False,
+    marker_status: Optional[Dict[str, Any]] = None,
 ) -> None:
     if hb is None:
         return
@@ -575,9 +1325,13 @@ def _update_eval_heartbeat(
     owned_names = pdb_names[rank::world_size]
     if not owned_names:
         return
-    pending_owned = _pending_pdb_names(owned_names, task_eval_dir, eval_cfg, seed)
     owned_total = int(len(owned_names))
-    owned_done = int(owned_total - len(pending_owned))
+    if scan_complete:
+        pending_owned: list[str] = []
+        owned_done = int(owned_total)
+    else:
+        pending_owned = _pending_pdb_names(owned_names, task_eval_dir, eval_cfg, seed)
+        owned_done = int(owned_total - len(pending_owned))
 
     num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
     model_ids = _model_ids_from_cfg(eval_cfg)
@@ -591,6 +1345,8 @@ def _update_eval_heartbeat(
     eval_ptx = bool(getattr(eval_cfg, "eval_protenix", False))
 
     def _count_af2_done(monomer: bool) -> int:
+        if scan_complete:
+            return int(owned_total)
         if not (eval_monomer if monomer else eval_complex):
             return 0
         done = 0
@@ -605,6 +1361,8 @@ def _update_eval_heartbeat(
         return int(done)
 
     def _count_ptx_done(ptx_root: str, enabled: bool) -> int:
+        if scan_complete:
+            return int(owned_total)
         if not enabled:
             return 0
         done = 0
@@ -671,6 +1429,13 @@ def _update_eval_heartbeat(
         eval_extra["active_total"] = int(active_entry.get("total", 0) or 0)
     if metrics:
         eval_extra["metrics"] = metrics
+    if isinstance(marker_status, dict):
+        eval_extra["marker_valid"] = bool(marker_status.get("valid"))
+        eval_extra["marker_mode"] = str(marker_status.get("mode") or "")
+        eval_extra["marker_reason"] = str(marker_status.get("reason") or "")
+        eval_extra["marker_path"] = str(marker_status.get("marker_path") or "")
+    if scan_complete:
+        eval_extra["phase"] = "marker_complete"
 
     hb.update(
         produced_total=owned_done,
@@ -1180,6 +1945,10 @@ def _chain_authority_path(task_eval_dir: str) -> str:
     return os.path.join(task_eval_dir, "chain_authority.json")
 
 
+def _marker_state_path(task_eval_dir: str) -> str:
+    return os.path.join(task_eval_dir, "marker_state.json")
+
+
 def _normalize_chain_ids(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1566,6 +2335,65 @@ def _write_chain_authority(
         "version": 1,
     }
     _atomic_write_json(_chain_authority_path(task_eval_dir), payload)
+
+
+def _write_marker_state(
+    *,
+    task_eval_dir: str,
+    task_name: str,
+    run_id: int,
+    run_seed: int,
+    world_size: int,
+    pdb_names_digest: str,
+    marker_status: dict[str, Any],
+) -> None:
+    payload = {
+        "task": str(task_name),
+        "run_id": int(run_id),
+        "run_seed": int(run_seed),
+        "world_size": int(world_size),
+        "pdb_names_digest": str(pdb_names_digest),
+        "marker_status": marker_status,
+        "process_start_ns": int(_PROCESS_START_NS),
+        "updated_ns": int(time.time_ns()),
+        "updated_at": _iso_now(),
+        "version": 1,
+    }
+    _atomic_write_json(_marker_state_path(task_eval_dir), payload)
+
+
+def _wait_for_marker_state(
+    *,
+    task_eval_dir: str,
+    task_name: str,
+    run_id: int,
+    run_seed: int,
+    world_size: int,
+    pdb_names_digest: str,
+    timeout_s: int,
+    poll_s: int,
+) -> dict[str, Any]:
+    deadline = time.time() + max(int(timeout_s), 1)
+    poll_s = max(int(poll_s), 1)
+    path = _marker_state_path(task_eval_dir)
+    while True:
+        data = _read_json_obj(path)
+        if (
+            isinstance(data, dict)
+            and str(data.get("task") or "") == str(task_name)
+            and int(data.get("run_id", -1)) == int(run_id)
+            and int(data.get("run_seed", -1)) == int(run_seed)
+            and int(data.get("world_size", -1)) == int(world_size)
+            and str(data.get("pdb_names_digest", "")) == str(pdb_names_digest)
+            and int(data.get("updated_ns", -1)) >= int(_PROCESS_START_NS)
+            and isinstance(data.get("marker_status"), dict)
+        ):
+            return dict(data.get("marker_status") or {})
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"Timeout waiting for marker state for {task_name}: path={path}"
+            )
+        time.sleep(poll_s)
 
 
 def _wait_for_chain_authority(
@@ -2893,11 +3721,32 @@ def main(argv=None):
             expected_total = int(getattr(configs.sample_diffusion, "N_sample", 0) or 0)
             for t in task_names:
                 struct_dir = _diffusion_struct_dir(configs.dump_dir, run_id, t)
-                done = _existing_indices(struct_dir, t)
-                done = {i for i in done if 0 <= i < expected_total}
+                diffusion_marker_status = _aggregation_seed_marker_status(
+                    _eval_task_dir(configs.dump_dir, run_id, t),
+                    run_dir=f"runs/run_{int(run_id):03d}",
+                    task_name=t,
+                    eval_cfg=configs.eval.binder,
+                    expected_total=expected_total,
+                    pdb_names=_expected_pdb_names(t, expected_total),
+                    run_seed=run_seed,
+                )
+                if _marker_allows_eval_scan_bypass(diffusion_marker_status):
+                    present_count = int(expected_total)
+                    logger.info(
+                        "[pipeline] diffusion_state count scan bypassed task=%s run=%d seed=%d marker_mode=%s reason=%s",
+                        t,
+                        int(run_id),
+                        int(run_seed),
+                        str(diffusion_marker_status.get("mode")),
+                        str(diffusion_marker_status.get("reason")),
+                    )
+                else:
+                    done = _existing_indices(struct_dir, t)
+                    done = {i for i in done if 0 <= i < expected_total}
+                    present_count = int(len(done))
                 task_states[t] = {
                     "expected_total": expected_total,
-                    "present": int(len(done)),
+                    "present": present_count,
                 }
 
             _atomic_write_json(
@@ -2951,14 +3800,66 @@ def main(argv=None):
                 expected_total_for_eval = int(
                     getattr(configs.sample_diffusion, "N_sample", 0) or 0
                 )
-                has_pending_eval = _has_any_pending_eval_work(
-                    dump_dir=configs.dump_dir,
-                    run_id=run_id,
-                    active_tasks=set(active_tasks),
-                    expected_total=expected_total_for_eval,
-                    eval_cfg=configs.eval.binder,
-                    run_seed=run_seed,
-                )
+                marker_start = time.time()
+                marker_status_by_task: dict[str, dict[str, Any]] = {}
+                marker_complete_all = bool(active_tasks)
+                for marker_task in sorted(active_tasks):
+                    marker_pdb_names = _expected_pdb_names(
+                        marker_task,
+                        expected_total_for_eval,
+                    )
+                    status = _aggregation_seed_marker_status(
+                        _eval_task_dir(configs.dump_dir, run_id, marker_task),
+                        run_dir=f"runs/run_{int(run_id):03d}",
+                        task_name=marker_task,
+                        eval_cfg=configs.eval.binder,
+                        expected_total=expected_total_for_eval,
+                        pdb_names=marker_pdb_names,
+                        run_seed=run_seed,
+                    )
+                    marker_status_by_task[marker_task] = status
+                    if not _marker_allows_eval_scan_bypass(status):
+                        marker_complete_all = False
+                if marker_complete_all:
+                    has_pending_eval = False
+                    logger.info(
+                        "[pipeline] pending eval scan bypassed for target-template decision run=%d seed=%d tasks=%d elapsed_s=%.2f marker_modes=%s",
+                        int(run_id),
+                        int(run_seed),
+                        int(len(marker_status_by_task)),
+                        time.time() - marker_start,
+                        {
+                            task: status.get("mode")
+                            for task, status in marker_status_by_task.items()
+                        },
+                    )
+                else:
+                    logger.info(
+                        "[pipeline] pending eval scan start for target-template decision run=%d seed=%d marker_elapsed_s=%.2f marker_reasons=%s",
+                        int(run_id),
+                        int(run_seed),
+                        time.time() - marker_start,
+                        {
+                            task: status.get("reason")
+                            for task, status in marker_status_by_task.items()
+                        },
+                    )
+                    pending_scan_start = time.time()
+                    has_pending_eval = _has_any_pending_eval_work(
+                        dump_dir=configs.dump_dir,
+                        run_id=run_id,
+                        active_tasks=set(active_tasks),
+                        expected_total=expected_total_for_eval,
+                        eval_cfg=configs.eval.binder,
+                        run_seed=run_seed,
+                    )
+                    logger.info(
+                        "[pipeline] pending eval scan end for target-template decision run=%d seed=%d has_pending=%s elapsed_s=%.2f",
+                        int(run_id),
+                        int(run_seed),
+                        str(bool(has_pending_eval)).lower(),
+                        time.time() - pending_scan_start,
+                    )
 
                 if not has_pending_eval:
                     decision_source = "no_pending_eval"
@@ -3180,20 +4081,86 @@ def main(argv=None):
         for task_name in sorted(active_tasks):
             os.environ["PXDESIGN_TASK_NAME"] = str(task_name)
             struct_dir = _diffusion_struct_dir(configs.dump_dir, run_id, task_name)
-            done = _existing_indices(struct_dir, task_name)
-            done = {i for i in done if 0 <= i < expected_total}
-            diffusion_count = int(len(done))
-
             task_eval_dir = _eval_task_dir(configs.dump_dir, run_id, task_name)
             os.makedirs(task_eval_dir, exist_ok=True)
 
-            if not os.path.isdir(struct_dir):
-                if DIST_WRAPPER.rank == 0:
-                    logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
-                continue
-
             world_size = int(DIST_WRAPPER.world_size)
-            pdb_names = [f"{task_name}_sample_{int(i):06d}" for i in sorted(done)]
+
+            stagein_timeout = _clamp_env_int(
+                "PXDESIGN_STAGEIN_SOURCE_TIMEOUT_S", 900, 30, 7200
+            )
+            stagein_poll = _clamp_env_int(
+                "PXDESIGN_STAGEIN_SOURCE_POLL_S", 10, 2, 60
+            )
+
+            expected_pdb_names = _expected_pdb_names(task_name, expected_total)
+            marker_pdb_names_digest = _canonical_hash(expected_pdb_names)
+            if DIST_WRAPPER.rank == 0:
+                marker_check_start = time.time()
+                marker_status = _aggregation_seed_marker_status(
+                    task_eval_dir,
+                    run_dir=f"runs/run_{int(run_id):03d}",
+                    task_name=task_name,
+                    eval_cfg=configs.eval.binder,
+                    expected_total=expected_total,
+                    pdb_names=expected_pdb_names,
+                    run_seed=run_seed,
+                )
+                _write_marker_state(
+                    task_eval_dir=task_eval_dir,
+                    task_name=task_name,
+                    run_id=run_id,
+                    run_seed=run_seed,
+                    world_size=world_size,
+                    pdb_names_digest=marker_pdb_names_digest,
+                    marker_status=marker_status,
+                )
+                logger.info(
+                    "[pipeline] marker check task=%s run=%d seed=%d mode=%s usable_scan_bypass=%s reason=%s elapsed_s=%.2f counts=%s",
+                    task_name,
+                    int(run_id),
+                    int(run_seed),
+                    str(marker_status.get("mode")),
+                    str(_marker_allows_eval_scan_bypass(marker_status)).lower(),
+                    str(marker_status.get("reason")),
+                    time.time() - marker_check_start,
+                    marker_status.get("counts", {}),
+                )
+            else:
+                marker_status = _wait_for_marker_state(
+                    task_eval_dir=task_eval_dir,
+                    task_name=task_name,
+                    run_id=run_id,
+                    run_seed=run_seed,
+                    world_size=world_size,
+                    pdb_names_digest=marker_pdb_names_digest,
+                    timeout_s=stagein_timeout,
+                    poll_s=stagein_poll,
+                )
+
+            marker_scan_bypass = _marker_allows_eval_scan_bypass(marker_status)
+            if marker_scan_bypass:
+                pdb_names = list(expected_pdb_names)
+                diffusion_count = int(expected_total)
+                rw_struct_dir = _overlay_to_rw_path(struct_dir)
+                if rw_struct_dir and os.path.isdir(rw_struct_dir):
+                    struct_dir = rw_struct_dir
+                elif rw_struct_dir and DIST_WRAPPER.rank == 0:
+                    logger.info(
+                        "[pipeline] marker-complete rw struct dir unavailable; using original struct dir task=%s rw_struct_dir=%s",
+                        task_name,
+                        rw_struct_dir,
+                    )
+            else:
+                if not os.path.isdir(struct_dir):
+                    if DIST_WRAPPER.rank == 0:
+                        logger.warning(f"No diffusion directory for {task_name}: {struct_dir}")
+                    continue
+                done = _existing_indices(struct_dir, task_name)
+                done = {i for i in done if 0 <= i < expected_total}
+                diffusion_count = int(len(done))
+                pdb_names = [f"{task_name}_sample_{int(i):06d}" for i in sorted(done)]
+
             if not pdb_names:
                 if DIST_WRAPPER.rank == 0:
                     logger.info(
@@ -3202,12 +4169,46 @@ def main(argv=None):
                     )
                 continue
 
-            pending_names = _pending_pdb_names(
-                pdb_names,
-                task_eval_dir,
-                configs.eval.binder,
-                run_seed,
-            )
+            pdb_names_digest = _canonical_hash(pdb_names)
+            pending_scan_start = time.time()
+            if marker_scan_bypass:
+                pending_names = []
+                if DIST_WRAPPER.rank == 0:
+                    logger.info(
+                        "[pipeline] main eval pending scan bypassed task=%s run=%d seed=%d designs=%d marker_mode=%s reason=%s elapsed_s=%.2f",
+                        task_name,
+                        int(run_id),
+                        int(run_seed),
+                        int(len(pdb_names)),
+                        str(marker_status.get("mode")),
+                        str(marker_status.get("reason")),
+                        time.time() - pending_scan_start,
+                    )
+            else:
+                if DIST_WRAPPER.rank == 0:
+                    logger.info(
+                        "[pipeline] main eval pending scan start task=%s run=%d seed=%d designs=%d marker_reason=%s",
+                        task_name,
+                        int(run_id),
+                        int(run_seed),
+                        int(len(pdb_names)),
+                        str(marker_status.get("reason")),
+                    )
+                pending_names = _pending_pdb_names(
+                    pdb_names,
+                    task_eval_dir,
+                    configs.eval.binder,
+                    run_seed,
+                )
+                if DIST_WRAPPER.rank == 0:
+                    logger.info(
+                        "[pipeline] main eval pending scan end task=%s run=%d seed=%d pending=%d elapsed_s=%.2f",
+                        task_name,
+                        int(run_id),
+                        int(run_seed),
+                        int(len(pending_names)),
+                        time.time() - pending_scan_start,
+                    )
             pending_names = sorted(set(pending_names))
             pending_names_digest = _canonical_hash(pending_names)
             if sharded_prep_enabled:
@@ -3225,13 +4226,6 @@ def main(argv=None):
                 raise RuntimeError(
                     f"[pipeline] Shard ownership coverage mismatch for task {task_name}"
                 )
-
-            stagein_timeout = _clamp_env_int(
-                "PXDESIGN_STAGEIN_SOURCE_TIMEOUT_S", 900, 30, 7200
-            )
-            stagein_poll = _clamp_env_int(
-                "PXDESIGN_STAGEIN_SOURCE_POLL_S", 10, 2, 60
-            )
 
             if DIST_WRAPPER.rank == 0:
                 authoritative_chain_payload = _resolve_authoritative_chain_payload_rank0(
@@ -3269,6 +4263,8 @@ def main(argv=None):
                         eval_cfg=configs.eval.binder,
                         seed=run_seed,
                         step="chain_probe",
+                        scan_complete=marker_scan_bypass,
+                        marker_status=marker_status,
                         metrics={
                             "chain_probe_mode": authoritative_chain_payload.get(
                                 "chain_probe_mode"
@@ -3330,6 +4326,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="pdb_cache",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                     metrics={
                         "rank": int(DIST_WRAPPER.rank),
                         "pdb_cache_mode": rank_cache_stats.get("pdb_cache_mode"),
@@ -3364,6 +4362,8 @@ def main(argv=None):
                 eval_cfg=configs.eval.binder,
                 seed=run_seed,
                 step="pre_run_task",
+                scan_complete=marker_scan_bypass,
+                marker_status=marker_status,
             )
 
             my_pdb_names = list(my_owned_names)
@@ -3400,6 +4400,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="run_task",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                 )
                 try:
                     run_task(
@@ -3422,6 +4424,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="run_task_complete",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                 )
 
             output_summary = _shard_output_summary(
@@ -3461,6 +4465,8 @@ def main(argv=None):
                     "chain_payload": authoritative_chain_payload,
                     "owned_names_by_rank": owned_names_by_rank,
                     "diffusion_count": diffusion_count,
+                    "marker_status": marker_status,
+                    "marker_scan_bypass": bool(marker_scan_bypass),
                 }
             )
 
@@ -3475,30 +4481,54 @@ def main(argv=None):
                 owned_names_by_rank = {int(k): v for k, v in (meta["owned_names_by_rank"] or {}).items()}
                 chain_payload = meta["chain_payload"]
                 diffusion_count = meta["diffusion_count"]
+                marker_status = dict(meta.get("marker_status") or {})
+                marker_scan_bypass = bool(meta.get("marker_scan_bypass", False))
                 run_rel_dir = f"runs/run_{int(run_id):03d}"
                 rw_task_eval_dir = _overlay_to_rw_path(task_eval_dir) or ""
                 rw_struct_dir = _overlay_to_rw_path(struct_dir) or ""
-                eval_evidence_ok = _local_eval_dir_has_expected_outputs(
-                    rw_task_eval_dir,
-                    pdb_names,
-                    configs.eval.binder,
-                    run_seed,
-                )
-                struct_evidence_ok = _local_struct_dir_has_expected_outputs(
-                    rw_struct_dir,
-                    pdb_names,
-                )
+                path_select_start = time.time()
+                if marker_scan_bypass:
+                    eval_evidence_ok = False
+                    struct_evidence_ok = False
+                    logger.info(
+                        "[pipeline] aggregate evidence scans bypassed task=%s marker_mode=%s reason=%s",
+                        task_name,
+                        str(marker_status.get("mode")),
+                        str(marker_status.get("reason")),
+                    )
+                else:
+                    eval_evidence_ok = _local_eval_dir_has_expected_outputs(
+                        rw_task_eval_dir,
+                        pdb_names,
+                        configs.eval.binder,
+                        run_seed,
+                    )
+                    struct_evidence_ok = _local_struct_dir_has_expected_outputs(
+                        rw_struct_dir,
+                        pdb_names,
+                    )
                 aggregate_task_eval_dir, eval_source_reason = _select_rw_overlay_path(
                     task_eval_dir,
                     run_dir=run_rel_dir,
                     task_name=task_name,
                     evidence_ok=eval_evidence_ok,
+                    marker_status=marker_status,
+                    allow_marker_path=marker_scan_bypass,
                 )
                 aggregate_struct_dir, struct_source_reason = _select_rw_overlay_path(
                     struct_dir,
                     run_dir=run_rel_dir,
                     task_name=task_name,
                     evidence_ok=struct_evidence_ok,
+                    marker_status=marker_status,
+                    allow_marker_path=marker_scan_bypass,
+                )
+                logger.info(
+                    "[pipeline] aggregate path selection prepared task=%s marker_used=%s marker_mode=%s elapsed_s=%.2f",
+                    task_name,
+                    str(bool(marker_scan_bypass)).lower(),
+                    str(marker_status.get("mode") or ""),
+                    time.time() - path_select_start,
                 )
                 agg_timeout = _clamp_env_int(
                     "PXDESIGN_AGG_READY_TIMEOUT_S", 1800, 60, 21600
@@ -3507,6 +4537,14 @@ def main(argv=None):
                     "PXDESIGN_AGG_READY_POLL_S", 30, 5, 120
                 )
 
+                shard_wait_start = time.time()
+                logger.info(
+                    "[pipeline] shard manifest wait start task=%s marker_mode=%s timeout_s=%d poll_s=%d",
+                    task_name,
+                    str(marker_status.get("mode") or ""),
+                    int(agg_timeout),
+                    int(agg_poll),
+                )
                 ready_manifests = _wait_for_shards_ready(
                     task_eval_dir=aggregate_task_eval_dir,
                     task_name=task_name,
@@ -3519,7 +4557,19 @@ def main(argv=None):
                     poll_s=agg_poll,
                     expected_chain_payload=chain_payload,
                 )
+                logger.info(
+                    "[pipeline] shard manifest wait end task=%s manifests=%d elapsed_s=%.2f",
+                    task_name,
+                    int(len(ready_manifests)),
+                    time.time() - shard_wait_start,
+                )
 
+                aggregate_inputs_start = time.time()
+                logger.info(
+                    "[pipeline] aggregate input build start task=%s marker_mode=%s",
+                    task_name,
+                    str(marker_status.get("mode") or ""),
+                )
                 aggregate_pdb_dir, aggregate_source_counts = _build_aggregate_inputs(
                     task_eval_dir=aggregate_task_eval_dir,
                     task_name=task_name,
@@ -3532,6 +4582,12 @@ def main(argv=None):
                     struct_dir=aggregate_struct_dir,
                     attempt_token=attempt_token,
                 )
+                logger.info(
+                    "[pipeline] aggregate input build end task=%s pdb_dir=%s elapsed_s=%.2f",
+                    task_name,
+                    aggregate_pdb_dir,
+                    time.time() - aggregate_inputs_start,
+                )
                 rw_aggregate_pdb_dir = _overlay_to_rw_path(aggregate_pdb_dir) or ""
                 pdb_evidence_ok = _local_pdb_cache_has_expected_outputs(
                     rw_aggregate_pdb_dir,
@@ -3542,11 +4598,13 @@ def main(argv=None):
                     run_dir=run_rel_dir,
                     task_name=task_name,
                     evidence_ok=pdb_evidence_ok,
+                    marker_status=marker_status,
+                    allow_marker_path=False,
                 )
                 logger.info(
                     "[pipeline] aggregate path selection task=%s eval_dir=%s "
                     "struct_dir=%s pdb_dir=%s eval_source=%s struct_source=%s "
-                    "pdb_source=%s",
+                    "pdb_source=%s marker_mode=%s",
                     task_name,
                     aggregate_task_eval_dir,
                     aggregate_struct_dir,
@@ -3554,6 +4612,7 @@ def main(argv=None):
                     eval_source_reason,
                     struct_source_reason,
                     pdb_source_reason,
+                    str(marker_status.get("mode") or ""),
                 )
                 if hb is not None:
                     _update_eval_heartbeat(
@@ -3564,6 +4623,8 @@ def main(argv=None):
                         eval_cfg=configs.eval.binder,
                         seed=run_seed,
                         step="aggregate_inputs",
+                        scan_complete=marker_scan_bypass,
+                        marker_status=marker_status,
                         metrics={
                             "aggregate_fallback_converted_count": int(
                                 aggregate_source_counts.get(
@@ -3593,6 +4654,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="pre_aggregate",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                 )
 
                 os.environ["PXDESIGN_TASK_NAME"] = str(task_name)
@@ -3608,6 +4671,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="aggregate",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                 )
                 aggregate_cond_chains = _chain_ids_for_hint_compare(
                     chain_payload.get("cond_chains", [])
@@ -3615,21 +4680,37 @@ def main(argv=None):
                 aggregate_binder_chains = _chain_ids_for_hint_compare(
                     chain_payload.get("binder_chains", [])
                 )
-                aggregate_binder_eval(
-                    task_name=task_name,
-                    eval_dir=aggregate_task_eval_dir,
-                    pdb_dir=aggregate_pdb_dir,
-                    pdb_names=pdb_names,
-                    cond_chains=aggregate_cond_chains,
-                    binder_chains=aggregate_binder_chains,
-                    cfg=configs.eval.binder,
-                    seed=run_seed,
-                    analysis_workers=int(p.get("analysis_workers")),
+                aggregate_start = time.time()
+                logger.info(
+                    "[pipeline] aggregate_binder_eval start task=%s designs=%d marker_mode=%s eval_dir=%s pdb_dir=%s",
+                    task_name,
+                    int(len(pdb_names)),
+                    str(marker_status.get("mode") or ""),
+                    aggregate_task_eval_dir,
+                    aggregate_pdb_dir,
                 )
-                if keepalive is not None:
-                    stop_event, thread = keepalive
-                    stop_event.set()
-                    thread.join(timeout=1.0)
+                try:
+                    aggregate_binder_eval(
+                        task_name=task_name,
+                        eval_dir=aggregate_task_eval_dir,
+                        pdb_dir=aggregate_pdb_dir,
+                        pdb_names=pdb_names,
+                        cond_chains=aggregate_cond_chains,
+                        binder_chains=aggregate_binder_chains,
+                        cfg=configs.eval.binder,
+                        seed=run_seed,
+                        analysis_workers=int(p.get("analysis_workers")),
+                    )
+                finally:
+                    if keepalive is not None:
+                        stop_event, thread = keepalive
+                        stop_event.set()
+                        thread.join(timeout=1.0)
+                    logger.info(
+                        "[pipeline] aggregate_binder_eval end task=%s elapsed_s=%.2f",
+                        task_name,
+                        time.time() - aggregate_start,
+                    )
 
                 _update_eval_heartbeat(
                     hb,
@@ -3639,6 +4720,8 @@ def main(argv=None):
                     eval_cfg=configs.eval.binder,
                     seed=run_seed,
                     step="aggregate_complete",
+                    scan_complete=marker_scan_bypass,
+                    marker_status=marker_status,
                 )
 
                 csv_path = os.path.join(
