@@ -145,8 +145,16 @@ def _ariax_split_marker():
         "ptx_pdb": 10,
         "ptx_mini": 0,
     }
-    marker["expected_counts"] = dict(split_counts)
-    marker["counts"] = dict(split_counts)
+    marker.pop("expected_counts", None)
+    marker.pop("counts", None)
+    marker["expected"] = {
+        "designs": 10,
+        "seq_outputs": 10,
+        "af2_outputs": 20,
+        "ptx_outputs": 10,
+        "ptx_mini_outputs": 0,
+    }
+    marker["validation_counts"] = [dict(split_counts)]
     return marker
 
 
@@ -244,7 +252,7 @@ def test_split_observed_counts_accept_combined_expected_counts(tmp_path, monkeyp
 
 def test_split_count_marker_requires_af2_json_and_pdb(tmp_path, monkeypatch):
     marker = _ariax_split_marker()
-    marker["counts"]["af2_pdb"] = 19
+    marker["validation_counts"][0]["af2_pdb"] = 19
     status = _marker_status(tmp_path, monkeypatch, marker)
 
     assert status["usable_for_legacy_scan_bypass"] is False
@@ -253,10 +261,9 @@ def test_split_count_marker_requires_af2_json_and_pdb(tmp_path, monkeypatch):
 
 def test_af2_expected_count_includes_model_ids(tmp_path, monkeypatch):
     marker = _ariax_split_marker()
-    marker["expected_counts"]["af2_json"] = 40
-    marker["expected_counts"]["af2_pdb"] = 40
-    marker["counts"]["af2_json"] = 40
-    marker["counts"]["af2_pdb"] = 40
+    marker["expected"]["af2_outputs"] = 40
+    marker["validation_counts"][0]["af2_json"] = 40
+    marker["validation_counts"][0]["af2_pdb"] = 40
     status = _marker_status(
         tmp_path,
         monkeypatch,

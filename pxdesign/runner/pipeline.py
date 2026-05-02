@@ -314,6 +314,15 @@ def _marker_sections(
                 task_value = value.get(task_name) or value.get(str(task_name))
                 if isinstance(task_value, dict):
                     sections.append(task_value)
+            elif isinstance(value, list):
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    item_name = (
+                        item.get("task") or item.get("task_name") or item.get("name")
+                    )
+                    if item_name is None or str(item_name) == str(task_name):
+                        sections.append(item)
         sections.append(root)
     return sections
 
@@ -656,6 +665,22 @@ def _aggregation_seed_marker_status(
             "structures",
             "structure_cifs",
         ),
+        expected_aliases=(
+            "diffusion_cif_count",
+            "diffusion_cif",
+            "diffusion_cifs",
+            "diffusion_count",
+            "designs",
+            "num_designs",
+            "n_designs",
+            "samples",
+            "n_samples",
+            "cif_count",
+            "cif",
+            "cifs",
+            "structures",
+            "structure_cifs",
+        ),
     ):
         return status
     if not _check_marker_count(
@@ -671,6 +696,18 @@ def _aggregation_seed_marker_status(
             "seq_txt",
             "seqs_txt_count",
             "sequence_count",
+            "seq_count",
+            "seqs",
+        ),
+        expected_aliases=(
+            "sequence_txt_count",
+            "sequence_txt",
+            "seq_txt_count",
+            "seq_txt",
+            "seqs_txt_count",
+            "sequence_count",
+            "seq_outputs",
+            "sequence_outputs",
             "seq_count",
             "seqs",
         ),
