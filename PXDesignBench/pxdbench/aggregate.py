@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import json
+import logging
 import os
 import re
+import time
 from concurrent.futures import ProcessPoolExecutor
 from glob import glob
 from typing import Any, Dict, Iterable, List, Tuple
@@ -31,8 +33,18 @@ from pxdbench.permutation import permute_generated_min_complex_rmsd
 from pxdbench.tasks.base import BaseTask
 from pxdbench.utils import concat_dict_values, save_eval_results
 
+logger = logging.getLogger(__name__)
+
 _SEQ_RE = re.compile(r"^(?P<name>.+)_seq(?P<idx>\d+)\.txt$")
 _AF2_MODEL_RE = re.compile(r"_model(?P<idx>\d+)\.json$")
+_AF2_OUTPUT_RE = re.compile(
+    r"^(?P<name>.+)_seq(?P<seq_idx>\d+)"
+    r"(?P<monomer>_MONOMER_ONLY)?_model(?P<model_idx>\d+)"
+    r"\.(?P<ext>json|pdb)$"
+)
+_SAMPLE_DIR_RE = re.compile(r"^(?P<name>.+)_seq(?P<seq_idx>\d+)$")
+
+Af2Index = Dict[Tuple[str, int, bool], Dict[int, Dict[str, str]]]
 
 
 def _read_json(path: str) -> Dict[str, Any] | None:
@@ -80,22 +92,66 @@ def _scan_sample_keys(*paths: str) -> List[Tuple[str, int]]:
         if not base or not os.path.isdir(base):
             continue
         for fname in os.listdir(base):
-            if "_seq" in fname:
-                stem = fname
-                if stem.endswith(".json"):
-                    stem = stem[: -len(".json")]
-                if stem.endswith(".pdb"):
-                    stem = stem[: -len(".pdb")]
-                if stem.endswith(".cif"):
-                    stem = stem[: -len(".cif")]
-                parts = stem.rsplit("_seq", 1)
-                if len(parts) != 2:
-                    continue
-                name, idx_str = parts
-                idx_digits = "".join([c for c in idx_str if c.isdigit()])
-                if idx_digits.isdigit():
-                    keys.add((name, int(idx_digits)))
+            af2_match = _AF2_OUTPUT_RE.match(fname)
+            if af2_match:
+                keys.add(
+                    (
+                        af2_match.group("name"),
+                        int(af2_match.group("seq_idx")),
+                    )
+                )
+                continue
+
+            stem = fname
+            for ext in (".json", ".pdb", ".cif"):
+                if stem.endswith(ext):
+                    stem = stem[: -len(ext)]
+                    break
+            sample_match = _SAMPLE_DIR_RE.match(stem)
+            if sample_match:
+                keys.add(
+                    (
+                        sample_match.group("name"),
+                        int(sample_match.group("seq_idx")),
+                    )
+                )
     return sorted(keys)
+
+
+def _index_af2_outputs(af2_dir: str) -> Af2Index:
+    index: Af2Index = {}
+    if not os.path.isdir(af2_dir):
+        return index
+
+    start = time.time()
+    scanned = 0
+    matched = 0
+    logger.info("[aggregate] AF2 index build start dir=%s", af2_dir)
+    for fname in os.listdir(af2_dir):
+        scanned += 1
+        match = _AF2_OUTPUT_RE.match(fname)
+        if not match:
+            continue
+        matched += 1
+        sample_key = (
+            match.group("name"),
+            int(match.group("seq_idx")),
+            bool(match.group("monomer")),
+        )
+        model_idx = int(match.group("model_idx"))
+        ext = match.group("ext")
+        index.setdefault(sample_key, {}).setdefault(model_idx, {})[ext] = (
+            os.path.join(af2_dir, fname)
+        )
+    logger.info(
+        "[aggregate] AF2 index build end dir=%s scanned=%d matched=%d samples=%d elapsed_s=%.2f",
+        af2_dir,
+        scanned,
+        matched,
+        len(index),
+        time.time() - start,
+    )
+    return index
 
 
 def _collect_af2_metrics(
@@ -120,6 +176,34 @@ def _collect_af2_metrics(
     return concat_dict_values(stats_list), model_ids
 
 
+def _collect_af2_metrics_from_index(
+    af2_index: Af2Index,
+    af2_dir: str,
+    name: str,
+    seq_idx: int,
+    monomer: bool = False,
+) -> Tuple[Dict[str, Any], List[int], List[str]]:
+    sample_models = af2_index.get((name, int(seq_idx), bool(monomer)), {})
+    model_stats: Dict[int, Dict[str, Any]] = {}
+    for model_idx in sorted(sample_models):
+        fp = sample_models[model_idx].get("json")
+        if not fp:
+            continue
+        stats = _read_json(fp)
+        if stats is None:
+            continue
+        model_stats[model_idx] = stats
+    if not model_stats:
+        return {}, [], []
+    model_ids = sorted(model_stats.keys())
+    stats_list = [model_stats[m] for m in model_ids]
+    return (
+        concat_dict_values(stats_list),
+        model_ids,
+        _af2_pdb_paths(af2_dir, name, seq_idx, model_ids, monomer=monomer),
+    )
+
+
 def _af2_pdb_paths(
     af2_dir: str, name: str, seq_idx: int, model_ids: List[int], monomer: bool = False
 ) -> List[str]:
@@ -137,6 +221,11 @@ def _mean(values: Iterable[float]) -> float | None:
     return float(np.mean(vals))
 
 
+def _bump_lookup_stat(lookup_stats: Dict[str, int] | None, key: str) -> None:
+    if lookup_stats is not None:
+        lookup_stats[key] = lookup_stats.get(key, 0) + 1
+
+
 def _collect_ptx_metrics(
     ptx_dir: str,
     name: str,
@@ -144,20 +233,42 @@ def _collect_ptx_metrics(
     seed: int,
     binder_chain: str,
     suffix: str = "",
+    lookup_stats: Dict[str, int] | None = None,
 ) -> Tuple[Dict[str, Any], str | None]:
     sample_name = f"{name}_seq{seq_idx}"
     pred_root = os.path.join(
         ptx_dir, sample_name, f"seed_{int(seed)}", "predictions"
     )
     if not os.path.isdir(pred_root):
+        _bump_lookup_stat(lookup_stats, "missing_pred_root")
         return {}, None
-    summary_files = glob(
-        os.path.join(pred_root, "*_summary_confidence_sample_0.json")
+
+    summary_path = os.path.join(
+        pred_root,
+        f"{sample_name}_seed_{int(seed)}_summary_confidence_sample_0.json",
     )
+    alternate_summary_path = os.path.join(
+        pred_root, f"{sample_name}_summary_confidence_sample_0.json"
+    )
+    summary_files = []
+    if os.path.exists(summary_path):
+        summary_files = [summary_path]
+        _bump_lookup_stat(lookup_stats, "summary_exact")
+    elif os.path.exists(alternate_summary_path):
+        summary_files = [alternate_summary_path]
+        _bump_lookup_stat(lookup_stats, "summary_alternate_exact")
+    else:
+        summary_files = glob(
+            os.path.join(pred_root, "*_summary_confidence_sample_0.json")
+        )
+        if summary_files:
+            _bump_lookup_stat(lookup_stats, "summary_glob")
     if not summary_files:
+        _bump_lookup_stat(lookup_stats, "summary_missing")
         return {}, None
     summary = _read_json(summary_files[0])
     if summary is None:
+        _bump_lookup_stat(lookup_stats, "summary_invalid")
         return {}, None
 
     chain_ptm = summary.get("chain_ptm") or []
@@ -208,7 +319,22 @@ def _collect_ptx_metrics(
         else None,
     }
 
-    pdb_files = glob(os.path.join(pred_root, "*_sample_0.pdb"))
+    pdb_path = os.path.join(
+        pred_root, f"{sample_name}_seed_{int(seed)}_sample_0.pdb"
+    )
+    alternate_pdb_path = os.path.join(pred_root, f"{sample_name}_sample_0.pdb")
+    if os.path.exists(pdb_path):
+        pdb_files = [pdb_path]
+        _bump_lookup_stat(lookup_stats, "pdb_exact")
+    elif os.path.exists(alternate_pdb_path):
+        pdb_files = [alternate_pdb_path]
+        _bump_lookup_stat(lookup_stats, "pdb_alternate_exact")
+    else:
+        pdb_files = glob(os.path.join(pred_root, "*_sample_0.pdb"))
+        if pdb_files:
+            _bump_lookup_stat(lookup_stats, "pdb_glob")
+    if not pdb_files:
+        _bump_lookup_stat(lookup_stats, "pdb_missing")
     pred_pdb = pdb_files[0] if pdb_files else None
     return metrics, pred_pdb
 
@@ -360,11 +486,17 @@ def aggregate_binder_eval(
         for name, seq_idx in fallback_keys:
             sequences[(name, seq_idx)] = ""
 
+    af2_index = _index_af2_outputs(af2_dir)
     rows: List[Dict[str, Any]] = []
     analysis_jobs = []
     binder_chain = binder_chains[0] if binder_chains else None
+    ptx_lookup_stats: Dict[str, int] = {}
+    ptx_mini_lookup_stats: Dict[str, int] = {}
+    sorted_sequences = sorted(sequences.items())
+    total = len(sorted_sequences)
+    metrics_start = time.time()
 
-    for (name, seq_idx), sequence in sorted(sequences.items()):
+    for i, ((name, seq_idx), sequence) in enumerate(sorted_sequences, start=1):
         length = len(sequence) if isinstance(sequence, str) and sequence else None
         row = {
             "name": name,
@@ -373,25 +505,36 @@ def aggregate_binder_eval(
             "length": length,
         }
 
-        af2_metrics, model_ids = _collect_af2_metrics(af2_dir, name, seq_idx)
+        af2_metrics, _model_ids, af2_pdbs = _collect_af2_metrics_from_index(
+            af2_index, af2_dir, name, seq_idx, monomer=False
+        )
         row.update(af2_metrics)
-        af2_pdbs = _af2_pdb_paths(af2_dir, name, seq_idx, model_ids)
 
-        af2_mono_metrics, mono_ids = _collect_af2_metrics(
-            af2_dir, name, seq_idx, monomer=True
+        af2_mono_metrics, _mono_ids, af2_mono_pdbs = (
+            _collect_af2_metrics_from_index(
+                af2_index, af2_dir, name, seq_idx, monomer=True
+            )
         )
         row.update(af2_mono_metrics)
-        af2_mono_pdbs = _af2_pdb_paths(
-            af2_dir, name, seq_idx, mono_ids, monomer=True
-        )
 
         ptx_metrics, ptx_pdb = _collect_ptx_metrics(
-            ptx_dir, name, seq_idx, seed, binder_chain
+            ptx_dir,
+            name,
+            seq_idx,
+            seed,
+            binder_chain,
+            lookup_stats=ptx_lookup_stats,
         )
         row.update(ptx_metrics)
 
         ptx_mini_metrics, ptx_mini_pdb = _collect_ptx_metrics(
-            ptx_mini_dir, name, seq_idx, seed, binder_chain, suffix="_mini"
+            ptx_mini_dir,
+            name,
+            seq_idx,
+            seed,
+            binder_chain,
+            suffix="_mini",
+            lookup_stats=ptx_mini_lookup_stats,
         )
         row.update(ptx_mini_metrics)
 
@@ -409,9 +552,31 @@ def aggregate_binder_eval(
                 ptx_mini_pdb,
             )
         )
+        if i == total or i % 500 == 0:
+            logger.info(
+                "[aggregate] metrics collection task=%s done=%d total=%d elapsed_s=%.1f",
+                task_name,
+                i,
+                total,
+                time.time() - metrics_start,
+            )
+
+    logger.info(
+        "[aggregate] PTX lookup stats task=%s stats=%s mini_stats=%s",
+        task_name,
+        dict(sorted(ptx_lookup_stats.items())),
+        dict(sorted(ptx_mini_lookup_stats.items())),
+    )
 
     metrics_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
     if analysis_jobs:
+        analysis_start = time.time()
+        logger.info(
+            "[aggregate] analysis start task=%s jobs=%d analysis_workers=%d",
+            task_name,
+            len(analysis_jobs),
+            int(analysis_workers or 0),
+        )
         if analysis_workers and analysis_workers > 1:
             with ProcessPoolExecutor(max_workers=analysis_workers) as executor:
                 for name, seq_idx, metrics in executor.map(
@@ -422,6 +587,12 @@ def aggregate_binder_eval(
             for job in analysis_jobs:
                 name, seq_idx, metrics = _analysis_worker(job)
                 metrics_map[(name, int(seq_idx))] = metrics
+        logger.info(
+            "[aggregate] analysis end task=%s jobs=%d elapsed_s=%.1f",
+            task_name,
+            len(analysis_jobs),
+            time.time() - analysis_start,
+        )
 
     for row in rows:
         key = (row["name"], int(row["seq_idx"]))
@@ -443,6 +614,12 @@ def aggregate_binder_eval(
     )
     sample_save_path, summary_save_path = save_eval_results(
         sample_df, summary_dict, eval_dir, sample_fn, summary_fn
+    )
+    logger.info(
+        "[aggregate] results written task=%s sample_csv=%s summary_json=%s",
+        task_name,
+        sample_save_path,
+        summary_save_path,
     )
     return {
         "sample_save_path": sample_save_path,

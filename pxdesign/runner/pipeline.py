@@ -44,6 +44,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -88,6 +89,14 @@ EVAL_TOOL_GROUP = {
     "ptx_mini": "protenix_eval",
     "ptx": "protenix_eval",
 }
+_AF2_OUTPUT_RE = re.compile(
+    r"^(?P<name>.+)_seq(?P<seq_idx>\d+)"
+    r"(?P<monomer>_MONOMER_ONLY)?_model(?P<model_idx>\d+)"
+    r"\.(?P<ext>json|pdb)$"
+)
+_SAMPLE_SEQ_RE = re.compile(r"^(?P<name>.+)_seq(?P<seq_idx>\d+)$")
+Af2CompletenessIndex = set[tuple[str, int, bool, int]]
+PtxCompletenessIndex = set[tuple[str, int]]
 
 
 # -----------------------------------------------------------------------------
@@ -1810,8 +1819,88 @@ def _model_ids_from_cfg(eval_cfg) -> list[int]:
     return [int(x) for x in model_ids]
 
 
+def _af2_required_keys(monomer: bool = False) -> set[str]:
+    if monomer:
+        return {"pLDDT_MONOMER", "pTM_MONOMER", "pAE_MONOMER"}
+    return {"pLDDT", "pTM", "i_pTM", "pAE", "i_pAE", "unscaled_i_pAE"}
+
+
+def _index_af2_completeness(af2_dir: str) -> Af2CompletenessIndex:
+    raw: dict[tuple[str, int, bool, int], dict[str, str]] = {}
+    complete: Af2CompletenessIndex = set()
+    if not af2_dir or not os.path.isdir(af2_dir):
+        return complete
+
+    for fname in os.listdir(af2_dir):
+        match = _AF2_OUTPUT_RE.match(fname)
+        if not match:
+            continue
+        key = (
+            match.group("name"),
+            int(match.group("seq_idx")),
+            bool(match.group("monomer")),
+            int(match.group("model_idx")),
+        )
+        raw.setdefault(key, {})[match.group("ext")] = os.path.join(af2_dir, fname)
+
+    for key, paths in raw.items():
+        json_path = paths.get("json")
+        pdb_path = paths.get("pdb")
+        if not json_path or not pdb_path:
+            continue
+        if not _is_nonempty_file(json_path) or not _is_nonempty_file(pdb_path):
+            continue
+        model_data = _read_json_obj(json_path)
+        if model_data is None:
+            continue
+        required_keys = _af2_required_keys(monomer=key[2])
+        if any(k not in model_data for k in required_keys):
+            continue
+        complete.add(key)
+    return complete
+
+
+def _ptx_summary_exists(pred_dir: Path, sample_name: str, seed: int) -> bool:
+    current = pred_dir / (
+        f"{sample_name}_seed_{int(seed)}_summary_confidence_sample_0.json"
+    )
+    if current.is_file():
+        return True
+    alternate = pred_dir / f"{sample_name}_summary_confidence_sample_0.json"
+    if alternate.is_file():
+        return True
+    return (
+        next(pred_dir.glob("*_summary_confidence_sample_0.json"), None)
+        is not None
+    )
+
+
+def _index_ptx_completeness(ptx_dir: str, seed: int) -> PtxCompletenessIndex:
+    complete: PtxCompletenessIndex = set()
+    if not ptx_dir or not os.path.isdir(ptx_dir):
+        return complete
+
+    for sample_dir in Path(ptx_dir).iterdir():
+        if not sample_dir.is_dir() or sample_dir.name.startswith("."):
+            continue
+        match = _SAMPLE_SEQ_RE.match(sample_dir.name)
+        if not match:
+            continue
+        pred_dir = sample_dir / f"seed_{int(seed)}" / "predictions"
+        if not pred_dir.is_dir():
+            continue
+        if _ptx_summary_exists(pred_dir, sample_dir.name, seed):
+            complete.add((match.group("name"), int(match.group("seq_idx"))))
+    return complete
+
+
 def _has_af2_outputs(
-    af2_dir: str, name: str, seq_idx: int, model_ids: list[int], monomer: bool = False
+    af2_dir: str,
+    name: str,
+    seq_idx: int,
+    model_ids: list[int],
+    monomer: bool = False,
+    completeness_index: Af2CompletenessIndex | None = None,
 ) -> bool:
     return _af2_output_health(
         af2_dir=af2_dir,
@@ -1819,6 +1908,7 @@ def _has_af2_outputs(
         seq_idx=seq_idx,
         model_ids=model_ids,
         monomer=monomer,
+        completeness_index=completeness_index,
     )[0]
 
 
@@ -1828,16 +1918,20 @@ def _af2_output_health(
     seq_idx: int,
     model_ids: list[int],
     monomer: bool = False,
+    completeness_index: Af2CompletenessIndex | None = None,
 ) -> tuple[bool, list[str]]:
     suffix = "_MONOMER_ONLY" if monomer else ""
-    required_keys = {"pLDDT", "pTM", "i_pTM", "pAE", "i_pAE", "unscaled_i_pAE"} if not monomer else {
-        "pLDDT_MONOMER",
-        "pTM_MONOMER",
-        "pAE_MONOMER",
-    }
+    required_keys = _af2_required_keys(monomer=monomer)
     reasons: list[str] = []
     for model_id in model_ids:
         model_num = int(model_id) + 1
+        if completeness_index is not None:
+            key = (name, int(seq_idx), bool(monomer), int(model_num))
+            if key not in completeness_index:
+                reasons.append(
+                    f"model{model_num}:missing_or_invalid_indexed_output"
+                )
+            continue
         fp = os.path.join(
             af2_dir, f"{name}_seq{int(seq_idx)}{suffix}_model{model_num}.json"
         )
@@ -1891,11 +1985,24 @@ def _af2_output_summary_entry(
     return False, [f"{name}_seq{int(seq_idx)}"], reasons
 
 
-def _has_ptx_outputs(ptx_dir: str, name: str, seq_idx: int, seed: int) -> bool:
-    pred_dir = Path(ptx_dir) / f"{name}_seq{int(seq_idx)}" / f"seed_{int(seed)}" / "predictions"
+def _has_ptx_outputs(
+    ptx_dir: str,
+    name: str,
+    seq_idx: int,
+    seed: int,
+    completeness_index: PtxCompletenessIndex | None = None,
+) -> bool:
+    if completeness_index is not None:
+        return (name, int(seq_idx)) in completeness_index
+    pred_dir = (
+        Path(ptx_dir)
+        / f"{name}_seq{int(seq_idx)}"
+        / f"seed_{int(seed)}"
+        / "predictions"
+    )
     if not pred_dir.is_dir():
         return False
-    return bool(list(pred_dir.glob("*_summary_confidence_sample_0.json")))
+    return _ptx_summary_exists(pred_dir, f"{name}_seq{int(seq_idx)}", seed)
 
 
 def _pending_pdb_names(
@@ -1903,31 +2010,95 @@ def _pending_pdb_names(
     task_eval_dir: str,
     eval_cfg,
     seed: int,
+    use_indexes: Optional[bool] = None,
 ) -> list[str]:
     af2_dir = os.path.join(task_eval_dir, "af2_pred")
     ptx_dir = os.path.join(task_eval_dir, "ptx_pred")
     ptx_mini_dir = os.path.join(task_eval_dir, "ptx_mini_pred")
     model_ids = _model_ids_from_cfg(eval_cfg)
     num_seqs = int(getattr(eval_cfg, "num_seqs", 1) or 1)
+    eval_complex = bool(getattr(eval_cfg, "eval_complex", False))
+    eval_monomer = bool(getattr(eval_cfg, "eval_binder_monomer", False))
+    eval_ptx_mini = bool(getattr(eval_cfg, "eval_protenix_mini", False))
+    eval_ptx = bool(getattr(eval_cfg, "eval_protenix", False))
+
+    threshold = _clamp_env_int(
+        "PXDESIGN_PENDING_EVAL_INDEX_THRESHOLD", 128, 0, 1000000
+    )
+    should_index = bool(len(pdb_names) * max(num_seqs, 1) >= threshold)
+    if use_indexes is not None:
+        should_index = bool(use_indexes)
+
+    af2_index: Af2CompletenessIndex | None = None
+    ptx_index: PtxCompletenessIndex | None = None
+    ptx_mini_index: PtxCompletenessIndex | None = None
+    if should_index:
+        index_start = time.time()
+        logger.info(
+            "[pipeline] pending eval index build start eval_dir=%s designs=%d num_seqs=%d",
+            task_eval_dir,
+            int(len(pdb_names)),
+            int(num_seqs),
+        )
+        if eval_complex or eval_monomer:
+            af2_index = _index_af2_completeness(af2_dir)
+        if eval_ptx_mini:
+            ptx_mini_index = _index_ptx_completeness(ptx_mini_dir, seed)
+        if eval_ptx:
+            ptx_index = _index_ptx_completeness(ptx_dir, seed)
+        logger.info(
+            "[pipeline] pending eval index build end eval_dir=%s af2_entries=%d ptx_mini_entries=%d ptx_entries=%d elapsed_s=%.2f",
+            task_eval_dir,
+            int(len(af2_index or set())),
+            int(len(ptx_mini_index or set())),
+            int(len(ptx_index or set())),
+            time.time() - index_start,
+        )
 
     pending = []
     for name in pdb_names:
         complete = True
         for seq_idx in range(num_seqs):
-            if getattr(eval_cfg, "eval_complex", False):
-                if not _has_af2_outputs(af2_dir, name, seq_idx, model_ids, monomer=False):
+            if eval_complex:
+                if not _has_af2_outputs(
+                    af2_dir,
+                    name,
+                    seq_idx,
+                    model_ids,
+                    monomer=False,
+                    completeness_index=af2_index,
+                ):
                     complete = False
                     break
-            if getattr(eval_cfg, "eval_binder_monomer", False):
-                if not _has_af2_outputs(af2_dir, name, seq_idx, model_ids, monomer=True):
+            if eval_monomer:
+                if not _has_af2_outputs(
+                    af2_dir,
+                    name,
+                    seq_idx,
+                    model_ids,
+                    monomer=True,
+                    completeness_index=af2_index,
+                ):
                     complete = False
                     break
-            if getattr(eval_cfg, "eval_protenix_mini", False):
-                if not _has_ptx_outputs(ptx_mini_dir, name, seq_idx, seed):
+            if eval_ptx_mini:
+                if not _has_ptx_outputs(
+                    ptx_mini_dir,
+                    name,
+                    seq_idx,
+                    seed,
+                    completeness_index=ptx_mini_index,
+                ):
                     complete = False
                     break
-            if getattr(eval_cfg, "eval_protenix", False):
-                if not _has_ptx_outputs(ptx_dir, name, seq_idx, seed):
+            if eval_ptx:
+                if not _has_ptx_outputs(
+                    ptx_dir,
+                    name,
+                    seq_idx,
+                    seed,
+                    completeness_index=ptx_index,
+                ):
                     complete = False
                     break
         if not complete:
@@ -1958,6 +2129,7 @@ def _has_any_pending_eval_work(
             task_eval_dir,
             eval_cfg,
             run_seed,
+            use_indexes=True,
         )
         if pending_names:
             return True
@@ -4058,7 +4230,7 @@ def main(argv=None):
                 last_use_target_template = bool(use_target_template)
             else:
                 wait_timeout_s = _clamp_env_int(
-                    "PXDESIGN_TARGET_TEMPLATE_STATE_TIMEOUT_S", 300, 30, 7200
+                    "PXDESIGN_TARGET_TEMPLATE_STATE_TIMEOUT_S", 1800, 30, 7200
                 )
                 wait_poll_ms = _clamp_env_int(
                     "PXDESIGN_TARGET_TEMPLATE_STATE_POLL_MS", 200, 50, 5000

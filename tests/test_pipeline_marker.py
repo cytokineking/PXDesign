@@ -97,6 +97,121 @@ class _EvalCfgTwoAf2Models(_EvalCfg):
             model_ids = [0, 1]
 
 
+class _Af2OnlyEvalCfg:
+    eval_complex = True
+    eval_binder_monomer = True
+    eval_protenix = False
+    eval_protenix_mini = False
+    num_seqs = 1
+
+    class tools:
+        class af2:
+            model_ids = [0]
+
+
+class _PtxOnlyEvalCfg:
+    eval_complex = False
+    eval_binder_monomer = False
+    eval_protenix = True
+    eval_protenix_mini = False
+    num_seqs = 1
+
+    class tools:
+        class af2:
+            model_ids = [0]
+
+
+def _write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def _write_text(path, text="ok"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_pending_eval_index_preserves_af2_completeness_rules(tmp_path):
+    eval_dir = tmp_path / "eval" / "task-a"
+    af2_dir = eval_dir / "af2_pred"
+    name = "target_seq_inside_name_sample_000123"
+    prefix = f"{name}_seq0"
+    complex_stats = {
+        "pLDDT": 1,
+        "pTM": 1,
+        "i_pTM": 1,
+        "pAE": 1,
+        "i_pAE": 1,
+        "unscaled_i_pAE": 1,
+    }
+    mono_stats = {
+        "pLDDT_MONOMER": 1,
+        "pTM_MONOMER": 1,
+        "pAE_MONOMER": 1,
+    }
+
+    _write_json(af2_dir / f"{prefix}_model1.json", complex_stats)
+    _write_text(af2_dir / f"{prefix}_model1.pdb")
+    _write_json(af2_dir / f"{prefix}_MONOMER_ONLY_model1.json", mono_stats)
+    _write_text(af2_dir / f"{prefix}_MONOMER_ONLY_model1.pdb")
+    _write_json(af2_dir / f"{prefix}_model2.json", complex_stats)
+
+    index = pipeline._index_af2_completeness(str(af2_dir))
+    assert (name, 0, False, 1) in index
+    assert (name, 0, True, 1) in index
+    assert (name, 0, False, 2) not in index
+
+    assert (
+        pipeline._pending_pdb_names(
+            [name], str(eval_dir), _Af2OnlyEvalCfg(), 2025, use_indexes=True
+        )
+        == []
+    )
+
+    (af2_dir / f"{prefix}_model1.pdb").unlink()
+    assert pipeline._pending_pdb_names(
+        [name], str(eval_dir), _Af2OnlyEvalCfg(), 2025, use_indexes=True
+    ) == [name]
+
+
+def test_pending_eval_index_accepts_seed_prefixed_ptx_summary_basename(tmp_path):
+    eval_dir = tmp_path / "eval" / "task-a"
+    name = "task-a_sample_000000"
+    sample_name = f"{name}_seq0"
+    pred_dir = eval_dir / "ptx_pred" / sample_name / "seed_2025" / "predictions"
+    _write_json(
+        pred_dir / f"{sample_name}_seed_2025_summary_confidence_sample_0.json", {}
+    )
+
+    assert pipeline._has_ptx_outputs(
+        str(eval_dir / "ptx_pred"), name, 0, 2025
+    )
+    assert (
+        pipeline._pending_pdb_names(
+            [name], str(eval_dir), _PtxOnlyEvalCfg(), 2025, use_indexes=True
+        )
+        == []
+    )
+
+
+def test_pending_eval_index_accepts_unseeded_ptx_summary_basename(tmp_path):
+    eval_dir = tmp_path / "eval" / "task-a"
+    name = "task-a_sample_000000"
+    sample_name = f"{name}_seq0"
+    pred_dir = eval_dir / "ptx_pred" / sample_name / "seed_2025" / "predictions"
+    _write_json(pred_dir / f"{sample_name}_summary_confidence_sample_0.json", {})
+
+    assert pipeline._has_ptx_outputs(
+        str(eval_dir / "ptx_pred"), name, 0, 2025
+    )
+    assert (
+        pipeline._pending_pdb_names(
+            [name], str(eval_dir), _PtxOnlyEvalCfg(), 2025, use_indexes=True
+        )
+        == []
+    )
+
+
 def _write_marker(root, marker):
     marker_dir = root / "output" / ".aggregation_seed"
     marker_dir.mkdir(parents=True, exist_ok=True)
