@@ -414,9 +414,13 @@ def rewrite_input_dict_inplace(
             filt["crop"] = convert_crop_auth_to_new(filt["crop"], residue_maps)
         cond_dict["filter"] = filt
 
-    # msa dict: {chain_id: ...}
+    # chain-scoped dicts: {chain_id: ...}
     if "msa" in cond_dict and cond_dict["msa"]:
         cond_dict["msa"] = {chain_mapping[k]: v for k, v in cond_dict["msa"].items()}
+    if "sequence" in cond_dict and cond_dict["sequence"]:
+        cond_dict["sequence"] = {
+            chain_mapping[k]: v for k, v in cond_dict["sequence"].items()
+        }
 
     input_dict["condition"] = cond_dict
     # hotspot dict: {chain_id: [res_ids]}

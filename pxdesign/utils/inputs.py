@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Union
@@ -11,6 +12,15 @@ from protenix.utils.file_io import load_gzip_pickle
 
 from pxdesign.data.utils import CIFWriter
 from pxdesign.utils.infer import convert_to_bioassembly_dict
+
+
+def _normalize_chain_sequence(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    seq = re.sub(r"\s+", "", value).upper()
+    if not seq or not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWYBXZJUO]+", seq):
+        return None
+    return seq
 
 
 class NpEncoder(json.JSONEncoder):
@@ -70,6 +80,7 @@ def parse_yaml_to_json(yaml_path, json_path=None):
     crop_dict = {}
     hotspot_dict = {}
     msa_dict_per_chain = {}
+    sequence_dict_per_chain = {}
 
     # --- 3. Chains Parsing ---
     chains_cfg = target_cfg.get("chains", {})
@@ -84,6 +95,8 @@ def parse_yaml_to_json(yaml_path, json_path=None):
         if props is None or (
             isinstance(props, str) and props.lower() in ["all", "full"]
         ):
+            props = {}
+        if not isinstance(props, dict):
             props = {}
 
         # --- Crop Logic ---
@@ -109,6 +122,11 @@ def parse_yaml_to_json(yaml_path, json_path=None):
         if "hotspots" in props:
             # YAML list is already a Python list
             hotspot_dict[chain_id] = props["hotspots"]
+
+        # --- Sequence Override Logic ---
+        sequence = _normalize_chain_sequence(props.get("sequence"))
+        if sequence:
+            sequence_dict_per_chain[chain_id] = sequence
 
         # --- MSA Logic ---
         if "msa" in props and props["msa"]:
@@ -145,6 +163,8 @@ def parse_yaml_to_json(yaml_path, json_path=None):
             }
         ],
     }
+    if sequence_dict_per_chain:
+        json_task["condition"]["sequence"] = sequence_dict_per_chain
 
     if json_path is not None:
         os.makedirs(os.path.dirname(json_path), exist_ok=True)

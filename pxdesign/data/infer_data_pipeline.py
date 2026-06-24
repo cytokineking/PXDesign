@@ -241,6 +241,9 @@ class InferenceDataset(Dataset):
 
         bioassembly_dict = json_dict["condition"]["bioassembly_dict"]
         label_entity_id_to_sequence = bioassembly_dict.get("sequences", {})
+        sequence_by_chain = json_dict["condition"].get("sequence", {})
+        if not isinstance(sequence_by_chain, dict):
+            sequence_by_chain = {}
 
         if "sequences" not in json_dict:
             json_dict["sequences"] = []
@@ -250,7 +253,9 @@ class InferenceDataset(Dataset):
             chains = atom_array[chain_mask]
             chain_type = chains[0].mol_type
             label_entity_id = chains.label_entity_id[0]
-            sequence = label_entity_id_to_sequence.get(label_entity_id, None)
+            sequence = sequence_by_chain.get(
+                chain, label_entity_id_to_sequence.get(label_entity_id, None)
+            )
 
             hotspot = None
             crop = None

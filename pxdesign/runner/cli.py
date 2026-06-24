@@ -707,10 +707,47 @@ def prepare_msa(
                 out[str(asym_id)] = seq
         return out
 
+    def _normalize_chain_sequence(value) -> str | None:
+        import re
+
+        if not isinstance(value, str):
+            return None
+        seq = re.sub(r"\s+", "", value).upper()
+        if not seq or not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWYBXZJUO]+", seq):
+            return None
+        return seq
+
+    def _extract_config_sequences(cfg: dict) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for chain_id, chain_cfg in cfg.get("target", {}).get("chains", {}).items():
+            if not isinstance(chain_cfg, dict):
+                continue
+            seq = _normalize_chain_sequence(chain_cfg.get("sequence"))
+            if seq:
+                out[str(chain_id)] = seq
+        return out
+
+    def _patch_input_json_sequences(input_json: dict, chain_to_seq: dict[str, str]) -> dict:
+        if not chain_to_seq:
+            return input_json
+        for seq_entry in input_json.get("sequences", []):
+            if not isinstance(seq_entry, dict) or len(seq_entry) != 1:
+                continue
+            entity = next(iter(seq_entry.values()))
+            if not isinstance(entity, dict):
+                continue
+            for asym_id in entity.get("label_asym_id", []):
+                seq = chain_to_seq.get(str(asym_id))
+                if seq:
+                    entity["sequence"] = seq
+                    break
+        return input_json
+
     # -----------------------------
     # main logic
     # -----------------------------
     cfg = _load_yaml(yaml_file)
+    cfg_chain_to_seq = _extract_config_sequences(cfg)
 
     cif_file, chain_mapping, tmp_ctx = _maybe_convert_pdb_to_cif_and_mapping(cfg)
     try:
@@ -722,6 +759,7 @@ def prepare_msa(
             avail_chains=avail_chains,
             chain_mapping=chain_mapping,
         )
+        input_json = _patch_input_json_sequences(input_json, cfg_chain_to_seq)
 
         msa_dirs: dict[str, str] = {}
 
@@ -746,6 +784,7 @@ def prepare_msa(
             )
 
             chain_to_seq = _extract_chain_sequences(input_json)
+            chain_to_seq.update(cfg_chain_to_seq)
 
             # Determine which chains need MSA injection (skip ones already set)
             needed: list[str] = []

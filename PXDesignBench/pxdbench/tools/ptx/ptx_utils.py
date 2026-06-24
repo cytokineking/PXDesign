@@ -447,6 +447,13 @@ def populate_msa_with_cache(
         precomp = msa.get("precomputed_msa_dir") if isinstance(msa, dict) else None
         return not precomp
 
+    def _missing_sequence_error(entity: dict) -> ValueError:
+        label_ids = entity.get("label_asym_id") or entity.get("id") or "unknown"
+        return ValueError(
+            f"Cannot populate MSA for entity without sequence; label_asym_id={label_ids}. "
+            "Provide the full target-chain sequence or use a structure file with polymer sequence metadata."
+        )
+
     # Ensure base dirs exist
     os.makedirs(os.path.dirname(cache_file) or ".", exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
@@ -476,7 +483,8 @@ def populate_msa_with_cache(
         precomp = msa.get("precomputed_msa_dir") if isinstance(msa, dict) else None
         if precomp:
             seq = entity.get("sequence")
-            cache.update({_sanitize_sequence(seq): precomp})
+            if isinstance(seq, str) and _sanitize_sequence(seq):
+                cache.update({_sanitize_sequence(seq): precomp})
 
     # Collect needed sequences
     pending: Set[str] = set()
@@ -486,10 +494,10 @@ def populate_msa_with_cache(
             continue
         seq = entity.get("sequence")
         if not isinstance(seq, str):
-            continue
+            raise _missing_sequence_error(entity)
         sseq = _sanitize_sequence(seq)
         if not sseq:
-            continue
+            raise _missing_sequence_error(entity)
         wanted_pairs.append((i, j, sseq))
         if sseq not in cache:
             pending.add(sseq)
@@ -553,7 +561,10 @@ def populate_msa_with_cache(
     for i, j, entity in _iter_entities(new_data):
         if not _needs_msa(entity):
             continue
-        sseq = _sanitize_sequence(entity["sequence"])
+        seq = entity.get("sequence")
+        if not isinstance(seq, str) or not _sanitize_sequence(seq):
+            raise _missing_sequence_error(entity)
+        sseq = _sanitize_sequence(seq)
         if sseq in cache:
             if "msa" not in entity or not isinstance(entity["msa"], dict):
                 entity["msa"] = {}
