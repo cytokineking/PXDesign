@@ -2390,6 +2390,7 @@ def _resolve_authoritative_chain_payload_rank0(
     inferred_cond: list[str] = []
     inferred_binder: list[str] = []
     selected_probe_name: Optional[str] = None
+    used_cif_inference_fallback = False
     primary_candidate = probe_candidates[0]
     probe_deadline = time.time() + max(int(timeout_s), 1)
     per_probe_timeout = max(1, int(timeout_s) // max(len(probe_candidates), 1))
@@ -2410,6 +2411,28 @@ def _resolve_authoritative_chain_payload_rank0(
                 selected_cond_hint = list(hint_variant)
                 last_error = None
                 break
+            except Exception as e:
+                last_error = e
+        if selected_probe_name is None and cond_hint:
+            try:
+                inferred_cond, inferred_binder = _infer_chains_from_cif(
+                    name=probe_candidate,
+                    condition_hint=None,
+                    stage_timeout_s=candidate_timeout,
+                )
+                selected_probe_name = probe_candidate
+                selected_cond_hint = []
+                used_cif_inference_fallback = True
+                logger.warning(
+                    "[pipeline] chain hint mismatch task=%s sample=%s input_condition_hint=%s; "
+                    "using CIF-inferred cond=%s binder=%s",
+                    task_name,
+                    probe_candidate,
+                    sorted(_normalize_chain_ids(cond_hint)),
+                    sorted(inferred_cond),
+                    sorted(inferred_binder),
+                )
+                last_error = None
             except Exception as e:
                 last_error = e
         if selected_probe_name is not None:
@@ -2444,18 +2467,22 @@ def _resolve_authoritative_chain_payload_rank0(
         find_binder_chains(selected_probe_cif, observed_cond)
     )
     observed_all = sorted(set(observed_cond + observed_binder))
-    cond_hint = _map_chain_hints_to_observed_ids(
-        hints=_normalize_chain_ids(selected_cond_hint),
-        observed_chain_ids=observed_all,
-        task_name=task_name,
-        hint_label="condition",
-    )
-    binder_hint = _map_chain_hints_to_observed_ids(
-        hints=binder_hint,
-        observed_chain_ids=observed_all,
-        task_name=task_name,
-        hint_label="binder",
-    )
+    if used_cif_inference_fallback:
+        cond_hint = []
+        binder_hint = []
+    else:
+        cond_hint = _map_chain_hints_to_observed_ids(
+            hints=_normalize_chain_ids(selected_cond_hint),
+            observed_chain_ids=observed_all,
+            task_name=task_name,
+            hint_label="condition",
+        )
+        binder_hint = _map_chain_hints_to_observed_ids(
+            hints=binder_hint,
+            observed_chain_ids=observed_all,
+            task_name=task_name,
+            hint_label="binder",
+        )
 
     if cond_hint and inferred_cond and _canonical_hash(
         _chain_ids_for_hint_compare(cond_hint)
@@ -2501,7 +2528,11 @@ def _resolve_authoritative_chain_payload_rank0(
         cond_final,
         binder_final,
         probe_metadata={
-            "chain_probe_mode": "single_probe_one_sanity",
+            "chain_probe_mode": (
+                "single_probe_one_sanity_hint_fallback"
+                if used_cif_inference_fallback
+                else "single_probe_one_sanity"
+            ),
             "chain_probe_primary_sample": selected_probe_name,
             "chain_probe_sanity_sample": sanity_probe_name,
             "chain_probe_sanity_status": sanity_status,

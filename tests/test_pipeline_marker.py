@@ -457,3 +457,41 @@ def test_marker_complete_heartbeat_is_scan_free(monkeypatch):
         "done": 2,
         "total": 2,
     }
+
+
+def test_chain_authority_falls_back_when_generated_cif_renames_condition_chain(
+    tmp_path, monkeypatch
+):
+    task_name = "task-a"
+    sample_name = f"{task_name}_sample_000000"
+    struct_dir = tmp_path / "structures"
+    _write_text(struct_dir / f"{sample_name}.cif", "nonempty")
+
+    def fake_find_cond_chains(cif_path):
+        assert str(cif_path).endswith(f"{sample_name}.cif")
+        return ["A0"]
+
+    def fake_find_binder_chains(cif_path, condition_chains):
+        assert str(cif_path).endswith(f"{sample_name}.cif")
+        normalized = pipeline._normalize_chain_ids(condition_chains)
+        if normalized in (["D"], ["D0"]):
+            raise AssertionError("input hint is not present in generated CIF")
+        assert normalized == ["A0"]
+        return ["B0"]
+
+    monkeypatch.setattr(pipeline, "find_cond_chains", fake_find_cond_chains)
+    monkeypatch.setattr(pipeline, "find_binder_chains", fake_find_binder_chains)
+
+    payload = pipeline._resolve_authoritative_chain_payload_rank0(
+        task_eval_dir=str(tmp_path / "eval"),
+        task_name=task_name,
+        struct_dir=str(struct_dir),
+        probe_names=[sample_name],
+        task_input={"condition": {"filter": {"chain_id": ["D"]}}},
+        timeout_s=5,
+        poll_s=1,
+    )
+
+    assert payload["cond_chains"] == ["A0"]
+    assert payload["binder_chains"] == ["B0"]
+    assert payload["chain_probe_mode"] == "single_probe_one_sanity_hint_fallback"

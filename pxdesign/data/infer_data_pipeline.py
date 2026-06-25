@@ -253,9 +253,10 @@ class InferenceDataset(Dataset):
             chains = atom_array[chain_mask]
             chain_type = chains[0].mol_type
             label_entity_id = chains.label_entity_id[0]
-            sequence = sequence_by_chain.get(
-                chain, label_entity_id_to_sequence.get(label_entity_id, None)
-            )
+            sequence_override = sequence_by_chain.get(chain)
+            sequence = sequence_override or label_entity_id_to_sequence.get(label_entity_id, None)
+            if sequence_override and chain_type == "ligand":
+                chain_type = "protein"
 
             hotspot = None
             crop = None
